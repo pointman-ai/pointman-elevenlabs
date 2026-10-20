@@ -28,6 +28,8 @@ fn the_key_is_in_the_calls_environment_only() {
         let state = node.state_dir_path().canonicalize().unwrap();
         let cwd = std::path::Path::new(&c.cwd).canonicalize().unwrap();
         assert!(cwd.starts_with(&state), "{} runs outside the extension's folders", c.cwd);
+        assert_eq!(c.base, "https://api.elevenlabs.io", "the API address is pinned");
+        assert_eq!(c.proxy, "||", "every proxy is pinned empty");
         for name in &c.env {
             let allowed = [
                 "PATH",
@@ -43,6 +45,17 @@ fn the_key_is_in_the_calls_environment_only() {
                 "SHLVL",
                 "_",
                 "OLDPWD",
+                // pinned: where the key goes
+                "ELEVENLABS_BASE_URL",
+                "ELEVENLABS_PROXY",
+                "HTTPS_PROXY",
+                "HTTP_PROXY",
+                "ALL_PROXY",
+                "https_proxy",
+                "http_proxy",
+                "all_proxy",
+                "ELEVENLABS_INSECURE",
+                "ELEVENLABS_CA_BUNDLE",
             ];
             assert!(allowed.contains(&name.as_str()), "the CLI got {name}");
         }
@@ -76,12 +89,26 @@ fn isolate_reports_progress_posts_the_audio_and_its_credits() {
     assert!(out.path.ends_with("talk-isolated.mp3"), "{}", out.path.display());
     assert_eq!(std::fs::read(&out.path).unwrap(), b"ID3isolated");
     assert_eq!(out.meta["file"], "talk.wav");
-    assert_eq!(done.result["credits"], json!({"used": 333, "left": 98_667, "shared": false}));
+    assert_eq!(done.result["credits"], json!({"used": 333, "left": 98_667, "shared": false, "pending": false}));
     let text = done.result["text"].as_str().unwrap();
     assert!(
         text.starts_with("Isolated the voice in talk.wav") && text.ends_with("Used 333 credits; 98,667 left."),
         "{text}"
     );
+}
+
+/// ElevenLabs can count a call's credits a few seconds after it answers (a real 20 s isolate's showed none at
+/// once): an unchanged balance is read again before saying what it used, never "0".
+#[test]
+fn credits_counted_late_are_waited_for() {
+    let fake = Fake::new();
+    fake.bills_late();
+    let (folder, file) = media();
+    let node = node(&fake, &[("elevenlabs.main", KEY)], &[folder.path()]);
+    let done = node.run("elevenlabs.isolate", json!({"file": file})).unwrap();
+    assert_eq!(done.result["credits"], json!({"used": 333, "left": 98_667, "shared": false, "pending": false}));
+    let stages: Vec<String> = done.progress.iter().filter_map(|p| p.stage.clone()).collect();
+    assert!(stages.iter().any(|s| s == "waiting for ElevenLabs to count the credits it used"), "{stages:?}");
 }
 
 /// Cancelling an isolate stops the CLI at once.

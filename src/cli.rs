@@ -1,7 +1,9 @@
 //! ElevenLabs' CLI: where it is, its version, and running it. Each call runs in a scratch folder of the
 //! extension's own (the CLI reads a `.env` in its working folder and the ones above it), with only the node's
 //! few environment variables and, when there is one, the key as ELEVENLABS_API_KEY: never on its command line,
-//! never on disk. Whatever comes back has the key taken out.
+//! never on disk. Where the key goes is pinned too: ELEVENLABS_BASE_URL is the `base_url` setting's, and every
+//! proxy and TLS override the CLI honours is set empty, so nothing (a `.env` above, a later CLI that reads more
+//! of one) can send it elsewhere. Whatever comes back has the key taken out.
 
 use std::ffi::OsStr;
 use std::fmt;
@@ -16,6 +18,27 @@ use serde_json::Value;
 
 /// What a call passes on from the extension's own environment (the node's): never anything else.
 const ENV_KEEP: [&str; 6] = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR"];
+/// ElevenLabs' API, unless the `base_url` setting says another (an EU-residency account's).
+pub const BASE_URL: &str = "https://api.elevenlabs.io";
+/// Set empty on every call: what would send its requests, key and all, through somewhere else, or trust another
+/// certificate (`elevenlabs --help`'s variables, and the standard ones it honours).
+const PINNED_EMPTY: [&str; 9] = [
+    "ELEVENLABS_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "ELEVENLABS_INSECURE",
+    "ELEVENLABS_CA_BUNDLE",
+];
+
+/// Whether `url` may be where the key goes: https, or http on this machine (a test's server).
+pub fn base_url_ok(url: &str) -> bool {
+    let local = ["http://127.0.0.1:", "http://localhost:", "http://127.0.0.1/", "http://localhost/"];
+    (url.starts_with("https://") && url.len() > "https://".len()) || local.iter().any(|l| url.starts_with(l))
+}
 /// How much of a call's stdout is kept: a voices list is well under it, and `-o -` audio isn't wanted back.
 const STDOUT_MAX: usize = 32 * 1024 * 1024;
 const STDERR_MAX: usize = 256 * 1024;
@@ -103,12 +126,14 @@ pub struct Call<'a> {
     pub key: Option<&'a str>,
     /// ELEVENLABS_VIA: the product token ElevenLabs' CLI adds to its User-Agent.
     pub via: Option<&'a str>,
+    /// ELEVENLABS_BASE_URL: where the CLI sends its requests (BASE_URL unless set).
+    pub base_url: &'a str,
     pub timeout: Option<Duration>,
 }
 
 impl<'a> Call<'a> {
     pub fn new(cli: &'a Path, cwd: &'a Path, args: Vec<String>) -> Self {
-        Call { cli, cwd, args, key: None, via: None, timeout: None }
+        Call { cli, cwd, args, key: None, via: None, base_url: BASE_URL, timeout: None }
     }
 
     pub fn key(mut self, key: Option<&'a str>) -> Self {
@@ -118,6 +143,11 @@ impl<'a> Call<'a> {
 
     pub fn via(mut self, via: &'a str) -> Self {
         self.via = Some(via);
+        self
+    }
+
+    pub fn base_url(mut self, url: &'a str) -> Self {
+        self.base_url = url;
         self
     }
 
@@ -194,6 +224,9 @@ pub fn error_of(ran: &Ran) -> CliError {
 /// Run a call, checking `cancelled` (then killing it, as `Cancelled`) and calling `tick` with the time so far
 /// about every two seconds.
 pub fn run(call: &Call, cancelled: &dyn Fn() -> bool, tick: &mut dyn FnMut(Duration)) -> anyhow::Result<Ran> {
+    if !base_url_ok(call.base_url) {
+        bail!("{} isn't https: the key only goes to ElevenLabs over https", call.base_url);
+    }
     std::fs::create_dir_all(call.cwd).with_context(|| format!("making {}", call.cwd.display()))?;
     let mut command = Command::new(call.cli);
     command.args(&call.args).current_dir(call.cwd).env_clear();
@@ -203,6 +236,10 @@ pub fn run(call: &Call, cancelled: &dyn Fn() -> bool, tick: &mut dyn FnMut(Durat
         }
     }
     command.env("NO_COLOR", "1");
+    command.env("ELEVENLABS_BASE_URL", call.base_url);
+    for key in PINNED_EMPTY {
+        command.env(key, "");
+    }
     if let Some(via) = call.via {
         command.env("ELEVENLABS_VIA", via);
     }
@@ -321,6 +358,15 @@ mod tests {
                 code: Some(2), stdout: vec![], stderr: "error: unexpected argument '--nope'\n\nFor more…\n".into()
             };
         assert_eq!(error_of(&plain).message, "For more…");
+    }
+
+    #[test]
+    fn the_key_goes_only_to_https() {
+        assert!(base_url_ok("https://api.elevenlabs.io") && base_url_ok("https://api.eu.residency.elevenlabs.io"));
+        assert!(base_url_ok("http://127.0.0.1:8765"), "a test's server, on this machine");
+        for bad in ["http://api.elevenlabs.io", "https://", "ftp://x", "http://127.0.0.1.evil.com", ""] {
+            assert!(!base_url_ok(bad), "{bad}");
+        }
     }
 
     #[test]

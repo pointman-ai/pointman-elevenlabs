@@ -26,7 +26,6 @@ linux = ["/usr/local/bin/elevenlabs"]
 
 [permissions]
 network = true                   # ElevenLabs' API, through its CLI; and its releases on GitHub
-drives_apps = ["elevenlabs"]     # ElevenLabs' CLI
 secrets = ["elevenlabs.*"]       # API keys, kept in the vault as elevenlabs.<label>
 
 [[credentials]]
@@ -45,6 +44,13 @@ type = "string"
 title = "ElevenLabs CLI"
 description = "The `elevenlabs` to run, when it isn't on the node's PATH or in /opt/homebrew/bin or /usr/local/bin. With none, the extension installs ElevenLabs' own build in its state folder."
 default = ""
+
+[settings.properties.base_url]
+type = "string"
+title = "API address"
+description = "Where every call goes, key and all: ElevenLabs' own unless your account lives elsewhere (an EU-residency one's). Pinned for each call, whatever a .env says."
+pattern = "^https://"
+default = "https://api.elevenlabs.io"
 
 [settings.properties.account]
 type = "string"
