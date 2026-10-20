@@ -1,30 +1,120 @@
-# The template's `hello` extension as a Rust binary. Rename `hello` (the id, and every command, tool
-# and event name that starts with it) to start your own.
+# ElevenLabs on Pointman's machines (James, Pointman thread 10399 [15505]; the brief is thread 15508): a thin
+# wrapper of ElevenLabs' official CLI (github.com/elevenlabs/cli, `elevenlabs <service> <verb>`). The machine's own
+# `elevenlabs` when it has one, else ElevenLabs' release build installed into the extension's state folder after
+# checking its sha256. The key comes from the vault for each call, as ELEVENLABS_API_KEY in that call's environment
+# only: never on disk, never `auth login`.
 [extension]
-id = "hello"
-name = "Hello"
+id = "elevenlabs"
+name = "ElevenLabs"
 version = "0.1.0"
 publisher = "aurelio"
-summary = "A template: one command that writes a greeting to a file."
+summary = "ElevenLabs' CLI on this machine: voice isolation, text to speech, transcripts, word timings, voices and credits."
 node = ">=0.1,<1"
 platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 
 [run]
-command = ["bin/hello"]      # the release build, in the package's bin/
+command = ["bin/elevenlabs"]
 runtime = "binary"
 
-[permissions]
-secrets = []                 # vault names it may open, or prefixes like "hello.*"
+# guidance for agents on a node with it: which command for what, credits first, dry runs first, never a key in a post
+[behavior]
+skill = "SKILLS.md"
 
-[[commands]]
-kind = "hello.greet"
-title = "Greet"
-params = {type = "object", properties = {name = {type = "string"}}, required = ["name"]}
-lane = "main"                # commands in a lane run one at a time
+[detect]
+macos = ["/opt/homebrew/bin/elevenlabs", "/usr/local/bin/elevenlabs"]
+linux = ["/usr/local/bin/elevenlabs"]
+
+[permissions]
+network = true                   # ElevenLabs' API, through its CLI; and its releases on GitHub
+drives_apps = ["elevenlabs"]     # ElevenLabs' CLI
+secrets = ["elevenlabs.*"]       # API keys, kept in the vault as elevenlabs.<label>
+
+[[credentials]]
+id = "key"
+title = "ElevenLabs API key"
+help = "On elevenlabs.io: Developers › API Keys › Create Key (sk_…). It's sealed in the vault and given to each CLI call, never written to disk."
+item = "elevenlabs.{label}"
+value = "(sk_[A-Za-z0-9]{20,200}|[a-f0-9]{32})"
+placeholder = "sk_…"
 
 [settings]
 type = "object"
 
-[settings.properties.greeting]
+[settings.properties.cli]
 type = "string"
-default = "Hello"
+title = "ElevenLabs CLI"
+description = "The `elevenlabs` to run, when it isn't on the node's PATH or in /opt/homebrew/bin or /usr/local/bin. With none, the extension installs ElevenLabs' own build in its state folder."
+default = ""
+
+[settings.properties.account]
+type = "string"
+title = "Which key"
+description = "The label of the vault's key to use (main, for elevenlabs.main). Empty: the first, by label. Never the key itself."
+default = ""
+
+[[commands]]
+kind = "elevenlabs.isolate"
+title = "Isolate the voice in an audio file (file) → audio"
+params = { type = "object", properties = { file = { type = "string", description = "A board file (pointman://asset/<id>) or a path in the extension's folders" } }, required = ["file"], additionalProperties = false }
+cancellable = true
+outputs = ["audio"]
+slash = "isolate"
+summary = "Isolate speech from background noise; the clean audio is posted back here"
+
+[[commands]]
+kind = "elevenlabs.tts"
+title = "Text to speech (text, voice name or id, model?) → audio"
+params = { type = "object", properties = { text = { type = "string" }, voice = { type = "string", description = "A voice's name (as elevenlabs.voices lists it) or its id" }, model = { type = "string", description = "A model id (eleven_multilingual_v2); ElevenLabs' default if not given" } }, required = ["text", "voice"], additionalProperties = false }
+cancellable = true
+outputs = ["audio"]
+slash = "tts"
+summary = "Speak text in one of your voices; the audio is posted back here"
+
+[[commands]]
+kind = "elevenlabs.stt"
+title = "Speech to text (file, model?, language?) → transcript"
+params = { type = "object", properties = { file = { type = "string", description = "A board file (pointman://asset/<id>) or a path in the extension's folders" }, model = { type = "string", description = "scribe_v1 if not given" }, language = { type = "string", description = "An ISO 639 code (en); detected if not given" } }, required = ["file"], additionalProperties = false }
+cancellable = true
+outputs = ["document"]
+slash = "stt"
+summary = "Transcribe an audio or video file, with word timings; posted back here"
+
+[[commands]]
+kind = "elevenlabs.align"
+title = "Word timings for a transcript (file, text) → JSON"
+params = { type = "object", properties = { file = { type = "string", description = "A board file (pointman://asset/<id>) or a path in the extension's folders" }, text = { type = "string", description = "What's said in it" } }, required = ["file", "text"], additionalProperties = false }
+cancellable = true
+outputs = ["document"]
+slash = "align"
+summary = "Force-align a transcript to its audio: each word's start and end"
+
+[[commands]]
+kind = "elevenlabs.voices"
+title = "List ElevenLabs voices (search?)"
+params = { type = "object", properties = { search = { type = "string", description = "Words in a voice's name, description or labels" } }, additionalProperties = false }
+slash = "voices"
+summary = "The voices this key can use: names, ids and kinds"
+
+[[commands]]
+kind = "elevenlabs.usage"
+title = "ElevenLabs credits used and left"
+params = { type = "object", properties = {}, additionalProperties = false }
+slash = "usage"
+summary = "The plan, credits used and left this period, and when they reset"
+
+[[commands]]
+kind = "elevenlabs.run"
+title = "Run the CLI (args; a dry run unless dry_run is false)"
+params = { type = "object", properties = { args = { type = "array", items = { type = "string" }, description = "The words after `elevenlabs`: [\"voices\", \"get\", \"--voice-id=…\"]" }, dry_run = { type = "boolean", default = true, description = "Only show the request (--dry-run). False sends it" }, confirm = { type = "boolean", default = false, description = "Needed with dry_run false for anything that deletes, removes, disables or clones" }, file = { type = "string", description = "A board file or a path, put where args say {file}" } }, required = ["args"], additionalProperties = false }
+cancellable = true
+outputs = ["audio", "document"]
+slash = "run"
+summary = "Any ElevenLabs CLI command: a dry run unless dry_run=false; deleting or cloning needs confirm=true"
+
+[[commands]]
+kind = "elevenlabs.add"
+title = "Add an ElevenLabs API key"
+params = { type = "object", properties = { name = { type = "string", description = "What to call it (main): lowercase letters, digits, . _ -" } } }
+slash = "add"
+form = "key"
+summary = "Add an ElevenLabs API key for this machine's CLI calls"
