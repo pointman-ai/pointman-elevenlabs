@@ -28,6 +28,8 @@ here=$(dirname "$0")
   echo "cwd=$(pwd)"
   echo "key=${ELEVENLABS_API_KEY-<none>}"
   echo "via=${ELEVENLABS_VIA-}"
+  echo "base=${ELEVENLABS_BASE_URL-<none>}"
+  echo "proxy=${HTTPS_PROXY-<none>}|${ELEVENLABS_PROXY-<none>}|${http_proxy-<none>}"
   echo "env=$(env | cut -d= -f1 | sort | tr '\n' ' ')"
   for a in "$@"; do echo "arg=$a"; done
 } >> "$here/calls.log"
@@ -43,9 +45,16 @@ if [ -z "$ELEVENLABS_API_KEY" ] || [ "$ELEVENLABS_API_KEY" = "sk_refused00000000
   echo '{"error": {"code": 401, "message": "Invalid API key", "reason": "unauthorized"}}' >&2; exit 1
 fi
 count=$(cat "$here/credits" 2>/dev/null || echo 1000)
-spend() { echo $((count + $1)) > "$here/credits"; }
+# with a `late` file, ElevenLabs counts a call's credits only at the second read after it
+spend() {
+  if [ -f "$here/late" ]; then echo "$1" > "$here/owed"; echo 0 > "$here/reads"; else echo $((count + $1)) > "$here/credits"; fi
+}
 case "$1 $2" in
   "user subscription")
+    if [ -f "$here/owed" ]; then
+      r=$(( $(cat "$here/reads") + 1 )); echo $r > "$here/reads"
+      if [ $r -ge 2 ]; then count=$((count + $(cat "$here/owed"))); echo $count > "$here/credits"; rm "$here/owed"; fi
+    fi
     printf '{"tier": "creator", "character_count": %s, "character_limit": 100000, "next_character_count_reset_unix": 1893456000}\n' "$count";;
   "audio-isolation convert")
     sleep "$(cat "$here/sleep" 2>/dev/null || echo 0)"
@@ -101,6 +110,11 @@ impl Fake {
         self.dir.path().join("elevenlabs")
     }
 
+    /// ElevenLabs counts each call's credits a little late: at the second read after it.
+    pub fn bills_late(&self) {
+        std::fs::write(self.dir.path().join("late"), "").unwrap();
+    }
+
     /// How long its isolate takes, in seconds.
     pub fn takes(&self, seconds: f64) {
         std::fs::write(self.dir.path().join("sleep"), seconds.to_string()).unwrap();
@@ -117,6 +131,8 @@ pub struct FakeCall {
     pub cwd: String,
     pub key: String,
     pub via: String,
+    pub base: String,
+    pub proxy: String,
     pub env: Vec<String>,
     pub args: Vec<String>,
 }
@@ -137,6 +153,8 @@ pub fn calls_in(log: &Path) -> Vec<FakeCall> {
                 Some(("cwd", v)) => c.cwd = v.into(),
                 Some(("key", v)) => c.key = v.into(),
                 Some(("via", v)) => c.via = v.into(),
+                Some(("base", v)) => c.base = v.into(),
+                Some(("proxy", v)) => c.proxy = v.into(),
                 Some(("env", v)) => c.env = v.split_whitespace().map(String::from).collect(),
                 Some(("arg", v)) => c.args.push(v.into()),
                 _ => {}
@@ -188,10 +206,15 @@ pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A fake GitHub: answers each path it's given, and nothing else.
+/// Each request a [`Server`] had: its first line, and its `xi-api-key`.
+pub type Asked = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+/// A fake GitHub (or ElevenLabs): answers each path it's given, and nothing else, and keeps each request's
+/// first line and `xi-api-key`.
 pub struct Server {
     pub url: String,
     pub routes: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub asked: Asked,
 }
 
 impl Server {
@@ -199,20 +222,28 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let routes: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
-        let r = routes.clone();
+        let asked: Asked = Arc::default();
+        let (r, a) = (routes.clone(), asked.clone());
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let r = r.clone();
+                let (r, a) = (r.clone(), a.clone());
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut first = String::new();
                     reader.read_line(&mut first).unwrap_or(0);
+                    let mut key = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                             break;
                         }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.trim().eq_ignore_ascii_case("xi-api-key") {
+                                key = Some(value.trim().to_string());
+                            }
+                        }
                     }
+                    a.lock().unwrap().push((first.trim().to_string(), key));
                     let path = first.split_whitespace().nth(1).unwrap_or("/").to_string();
                     let body = r.lock().unwrap().get(&path).cloned();
                     let mut stream = stream;
@@ -227,7 +258,7 @@ impl Server {
                 });
             }
         });
-        Server { url, routes }
+        Server { url, routes, asked }
     }
 
     pub fn serve(&self, path: &str, body: impl Into<Vec<u8>>) {

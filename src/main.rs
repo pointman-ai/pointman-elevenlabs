@@ -62,6 +62,13 @@ fn releases() -> String {
     std::env::var("POINTMAN_ELEVENLABS_RELEASES").unwrap_or_else(|_| install::RELEASES.to_string())
 }
 
+/// Where the CLI sends its requests, key and all: the `base_url` setting (an EU-residency account's API), else
+/// ElevenLabs' own. Pinned in each call's environment, whatever a `.env` says.
+fn base_url(h: &Handle) -> String {
+    let set = h.settings()["base_url"].as_str().map(|u| u.trim().trim_end_matches('/').to_string());
+    set.filter(|u| !u.is_empty()).unwrap_or_else(|| cli::BASE_URL.to_string())
+}
+
 fn find(h: &Handle) -> Option<Found> {
     let s = state(h);
     let own = std::env::current_exe().ok();
@@ -150,9 +157,9 @@ impl Account {
     }
 }
 
-fn account(cli: &Path, key: &Key, cwd: &Path) -> anyhow::Result<Account> {
+fn account(cli: &Path, key: &Key, cwd: &Path, base: &str) -> anyhow::Result<Account> {
     let args = vec!["user".into(), "subscription".into(), "get".into(), "--format=json".into()];
-    let call = Call::new(cli, cwd, args).key(Some(&key.value)).via(VIA).timeout(QUICK);
+    let call = Call::new(cli, cwd, args).key(Some(&key.value)).via(VIA).base_url(base).timeout(QUICK);
     let ran = cli::run(&call, &|| false, &mut |_| {})?;
     if !ran.ok() {
         return Err(failure(&ran, key));
@@ -180,21 +187,32 @@ fn failure(ran: &Ran, key: &Key) -> anyhow::Error {
 static PAID_NOW: AtomicUsize = AtomicUsize::new(0);
 static PAID_STARTED: AtomicU64 = AtomicU64::new(0);
 
+/// How long a paid call's unchanged balance is waited on, read again after each: 21 s in all.
+const CHARGE_WAITS: [Duration; 3] = [Duration::from_secs(3), Duration::from_secs(6), Duration::from_secs(12)];
+
 /// What a paid call cost, from the account's credits before and after it.
 #[derive(Debug, Clone, Default)]
 struct Credits {
     used: Option<i64>,
     left: Option<i64>,
+    /// Another of this machine's paid calls ran beside it, so the difference is theirs too.
     shared: bool,
+    /// ElevenLabs hadn't counted it yet when last read.
+    pending: bool,
 }
 
 impl Credits {
     fn json(&self) -> Value {
-        json!({"used": self.used, "left": self.left, "shared": self.shared})
+        json!({"used": self.used, "left": self.left, "shared": self.shared, "pending": self.pending})
     }
 
     fn line(&self) -> String {
         match (self.used, self.left) {
+            (_, Some(left)) if self.pending => format!(
+                "ElevenLabs hadn't counted its credits 20 s after it finished ({} left then): elevenlabs.usage shows \
+                 them once it has.",
+                words::thousands(left)
+            ),
             (Some(used), Some(left)) if self.shared => format!(
                 "The account used {} credits while it ran, with other ElevenLabs jobs going at the same time; {} left.",
                 words::thousands(used),
@@ -213,6 +231,7 @@ struct Ready {
     cli: PathBuf,
     key: Key,
     work: PathBuf,
+    base: String,
 }
 
 /// What health last read of the account: when, with which key, and what.
@@ -259,7 +278,7 @@ impl Ext {
         let key = key(&self.h)?;
         let cli = self.cli()?;
         std::fs::create_dir_all(&job.work).with_context(|| format!("making {}", job.work.display()))?;
-        Ok(Ready { cli, key, work: job.work.clone() })
+        Ok(Ready { cli, key, work: job.work.clone(), base: base_url(&self.h) })
     }
 
     /// A call for a job: cancellable, its stage and the time so far as progress.
@@ -277,7 +296,8 @@ impl Ext {
         stage: &str,
     ) -> anyhow::Result<Ran> {
         job.progress(None, stage);
-        let call = Call::new(cli, cwd, args).key(key.map(|k| k.value.as_str())).via(VIA);
+        let base = base_url(&self.h);
+        let call = Call::new(cli, cwd, args).key(key.map(|k| k.value.as_str())).via(VIA).base_url(&base);
         let ran = cli::run(&call, &|| job.cancelled(), &mut |so_far| {
             job.progress_detail(
                 None,
@@ -294,9 +314,17 @@ impl Ext {
         Ok(ran)
     }
 
-    /// `f`, a paid call, with the credits it used read before and after.
-    fn paid<T>(&self, r: &Ready, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<(T, Credits)> {
-        let before = match account(&r.cli, &r.key, &r.work) {
+    /// `f`, a paid call, with the credits it used read before and after. ElevenLabs can count a call's credits a
+    /// few seconds after it answers (a 20 s isolate's showed none at once), so for a call that always costs
+    /// (`charged`), an unchanged balance is read again a few times before saying it's not counted yet.
+    fn paid<T>(
+        &self,
+        job: &Job,
+        r: &Ready,
+        charged: bool,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<(T, Credits)> {
+        let before = match account(&r.cli, &r.key, &r.work, &r.base) {
             Ok(a) => Some(a),
             Err(e) if e.to_string().contains("refused the key") => return Err(e),
             Err(e) => {
@@ -310,13 +338,30 @@ impl Ext {
         let shared = others > 0 || PAID_STARTED.load(Ordering::SeqCst) != started;
         PAID_NOW.fetch_sub(1, Ordering::SeqCst);
         let made = done?;
-        let after = account(&r.cli, &r.key, &r.work)
-            .map_err(|e| self.h.log(format!("couldn't read the credits after a call: {e:#}")))
-            .ok();
+        let read = || {
+            account(&r.cli, &r.key, &r.work, &r.base)
+                .map_err(|e| self.h.log(format!("couldn't read the credits after a call: {e:#}")))
+                .ok()
+        };
+        let mut after = read();
+        let unchanged =
+            |after: &Option<Account>| before.as_ref().zip(after.as_ref()).is_some_and(|(b, a)| a.used == b.used);
+        if charged {
+            for wait in CHARGE_WAITS {
+                if !unchanged(&after) || job.cancelled() {
+                    break;
+                }
+                job.progress(None, "waiting for ElevenLabs to count the credits it used");
+                std::thread::sleep(wait);
+                after = read();
+            }
+        }
+        let pending = charged && unchanged(&after);
         let credits = Credits {
-            used: before.as_ref().zip(after.as_ref()).map(|(b, a)| a.used - b.used),
+            used: before.as_ref().zip(after.as_ref()).map(|(b, a)| a.used - b.used).filter(|_| !pending),
             left: after.as_ref().map(Account::left),
             shared,
+            pending,
         };
         Ok((made, credits))
     }
@@ -359,7 +404,7 @@ fn isolate(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         "--format=json".into(),
     ];
     let started = Instant::now();
-    let (_, credits) = x.paid(&r, || x.call(job, &r, args, &stage))?;
+    let (_, credits) = x.paid(job, &r, true, || x.call(job, &r, args, &stage))?;
     if std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) == 0 {
         bail!("ElevenLabs gave no audio for {name}");
     }
@@ -427,7 +472,7 @@ fn tts(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         args.push(format!("--model-id={model}"));
     }
     let stage = format!("speaking {} characters as {name}", text.chars().count());
-    let (_, credits) = x.paid(&r, || x.call(job, &r, args, &stage))?;
+    let (_, credits) = x.paid(job, &r, true, || x.call(job, &r, args, &stage))?;
     if std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) == 0 {
         bail!("ElevenLabs gave no audio");
     }
@@ -456,7 +501,7 @@ fn stt(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         args.push(format!("--language-code={language}"));
     }
     let stage = format!("transcribing {name} on ElevenLabs");
-    let (ran, credits) = x.paid(&r, || x.call(job, &r, args, &stage))?;
+    let (ran, credits) = x.paid(job, &r, true, || x.call(job, &r, args, &stage))?;
     let got = ran.json().context("ElevenLabs' transcript wasn't JSON")?;
     let text = got["text"].as_str().unwrap_or_default().trim().to_string();
     let count = got["words"].as_array().map_or(0, |w| w.iter().filter(|w| w["type"] != "spacing").count());
@@ -496,7 +541,7 @@ fn align(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         "--format=json".into(),
     ];
     let stage = format!("aligning {} words to {name}", text.split_whitespace().count());
-    let (ran, credits) = x.paid(&r, || x.call(job, &r, args, &stage))?;
+    let (ran, credits) = x.paid(job, &r, true, || x.call(job, &r, args, &stage))?;
     let got = ran.json().context("ElevenLabs' alignment wasn't JSON")?;
     let aligned = got["words"].as_array().cloned().unwrap_or_default();
     let out = r.work.join(format!("{}-alignment.json", words::stem(&name)));
@@ -568,7 +613,7 @@ fn voices(x: &Ext, job: &Job) -> anyhow::Result<Value> {
 fn usage(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     let r = x.ready(job)?;
     job.progress(None, "reading the account's credits");
-    let a = account(&r.cli, &r.key, &r.work)?;
+    let a = account(&r.cli, &r.key, &r.work, &r.base)?;
     let resets = a
         .resets
         .map(|t| format!(" They reset on {} (in {} days).", words::day(t), ((t - now()).max(0) + 43_199) / 86_400));
@@ -638,7 +683,8 @@ fn run(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         (x.call_with(job, &cli, key.as_ref(), &job.work, argv, "a dry run")?, None)
     } else {
         let r = x.ready(job)?;
-        let (ran, credits) = x.paid(&r, || x.call(job, &r, argv, &format!("running {}", cli::clip(&shown, 80))))?;
+        let stage = format!("running {}", cli::clip(&shown, 80));
+        let (ran, credits) = x.paid(job, &r, false, || x.call(job, &r, argv, &stage))?;
         (ran, Some(credits))
     };
     let made: Vec<PathBuf> = files_in(&job.work).into_iter().filter(|f| !before.contains(f)).collect();
@@ -717,7 +763,7 @@ fn health(x: &Ext) -> Value {
                 let read = match fresh {
                     Some((_, _, read)) => read.clone(),
                     None => {
-                        let read = account(&f.path, &k, &scratch).map_err(|e| format!("{e:#}"));
+                        let read = account(&f.path, &k, &scratch, &base_url(h)).map_err(|e| format!("{e:#}"));
                         *kept = Some((Instant::now(), k.name.clone(), read.clone()));
                         read
                     }
@@ -832,10 +878,12 @@ mod tests {
 
     #[test]
     fn credits_say_when_they_were_shared() {
-        let c = Credits { used: Some(1000), left: Some(99_000), shared: false };
+        let c = Credits { used: Some(1000), left: Some(99_000), shared: false, pending: false };
         assert_eq!(c.line(), "Used 1,000 credits; 99,000 left.");
         assert!(Credits { shared: true, ..c }.line().starts_with("The account used 1,000 credits while it ran"));
         assert_eq!(Credits::default().line(), "The credits it used couldn't be read.");
+        let late = Credits { used: None, left: Some(99_000), shared: false, pending: true };
+        assert!(late.line().starts_with("ElevenLabs hadn't counted its credits 20 s after it finished (99,000 left"));
     }
 
     #[test]

@@ -26,8 +26,10 @@ crate, for macOS and Linux (Apple silicon, Intel and ARM).
 - **Long jobs** run in the background, each on a thread of its own, so an 18-minute isolate holds up nobody.
   Each says what it's doing and for how long so far, and cancelling one stops the CLI at once.
 - **Credits:** each paid command reads the account's credits before and after, and says what it used and
-  what's left. When another of this machine's ElevenLabs jobs ran at the same time, it says so, since the
-  difference is then theirs too. Use from elsewhere with the same key (the CLI on a laptop) isn't seen.
+  what's left. ElevenLabs can count a call a few seconds after it answers, so an unchanged balance is read again
+  (after 3, 6 and 12 s) before it says the credits aren't counted yet. It never says 0. When another of this
+  machine's ElevenLabs jobs ran at the same time, it says so, since the difference is then theirs too. Use from
+  elsewhere with the same key (the CLI on a laptop) isn't seen.
 
 ### `elevenlabs.run`
 
@@ -54,6 +56,10 @@ only `elevenlabs.*` items.
 - **A folder of its own:** the CLI reads a `.env` in its working folder and the folders above it, so each call
   runs in the command's own work folder, inside the extension's state folder, with only the node's `PATH`,
   `HOME`, `USER`, `LANG`, `LC_ALL` and `TMPDIR` besides.
+- **Where it goes is pinned:** each call sets `ELEVENLABS_BASE_URL` to the `base_url` setting (https only), and
+  every proxy (`ELEVENLABS_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and the lowercase ones) and TLS override
+  (`ELEVENLABS_INSECURE`, `ELEVENLABS_CA_BUNDLE`) empty. A `.env` anywhere above can't send the key elsewhere,
+  whatever a later CLI reads from one. `tests/real_cli.rs` checks it with the real CLI.
 - **Which key:** the first by label, or the one the `account` setting names.
 - **Health:** with no key, the `key` part is failing and needs `auth`. A key ElevenLabs refuses is the same,
   naming it. With one, it says the plan and the credits left.
@@ -75,6 +81,7 @@ node.extensions.elevenlabs.<key> <value>`):
 | Setting | Default | |
 |---|---|---|
 | `cli` | none | The `elevenlabs` to run, when it isn't on the PATH or in Homebrew's folders |
+| `base_url` | `https://api.elevenlabs.io` | Where every call goes: change it only for an account whose API lives elsewhere (EU residency) |
 | `account` | the first | The label of the vault's key to use (`main` for `elevenlabs.main`), never the key itself |
 
 ## Guidance for agents
@@ -85,8 +92,9 @@ never a key in a post. Every agent run on a node with the extension gets it.
 ## Development
 
 - `cargo test`: the commands under the SDK's stand-in node, with a fake `elevenlabs` (a shell script that logs
-  each call and answers as the CLI does) and a fake GitHub release for the installer. Nothing reaches
-  ElevenLabs or GitHub.
+  each call and answers as the CLI does) and a fake GitHub release for the installer, and the real CLI against
+  two local servers (`tests/real_cli.rs`; skipped where there's no CLI, and the test workflow downloads one).
+  Nothing reaches ElevenLabs or GitHub.
 - `cargo test -- --ignored`: the real installer, from ElevenLabs' newest release (online).
 - `tests/live.rs`: the real ElevenLabs, with a key given to that one command by `pointman secrets run`. It
   spends credits.
