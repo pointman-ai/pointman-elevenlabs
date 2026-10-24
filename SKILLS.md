@@ -5,7 +5,7 @@ description: ElevenLabs through the elevenlabs extension: voice isolation, text 
 
 # ElevenLabs
 
-ElevenLabs runs through the `elevenlabs` extension on the machine that has it: ask with `run_on_machine`
+ElevenLabs runs through the `elevenlabs` extension on the machine that has it: ask with `create_job`
 (or `/elevenlabs <verb>` in a thread). Its key comes from the vault for each call. You never need it, and
 you never run `elevenlabs auth` or write a `.env`.
 
