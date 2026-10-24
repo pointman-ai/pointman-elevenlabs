@@ -40,7 +40,7 @@ fn usage_then_a_real_isolate() {
     println!("isolate: {}", done.result["text"].as_str().unwrap());
     println!("progress: {:?}", done.progress.iter().filter_map(|p| p.stage.clone()).collect::<Vec<_>>());
     let out = &done.outputs[0];
-    let kept = folder.join(out.path.file_name().unwrap());
+    let kept = folder.join(std::path::Path::new(&out.path).file_name().unwrap());
     std::fs::copy(&out.path, &kept).unwrap();
     println!("isolated audio: {} ({} bytes)", kept.display(), std::fs::metadata(&kept).unwrap().len());
 

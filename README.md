@@ -6,7 +6,8 @@ ElevenLabs' official CLI ([elevenlabs/cli](https://github.com/elevenlabs/cli), `
 each command is one CLI call, and `elevenlabs.run` passes anything else through.
 
 One Rust binary, `bin/elevenlabs`, on the [pointman-extension](https://github.com/pointman-ai/pointman-extension)
-crate, for macOS and Linux (Apple silicon, Intel and ARM).
+crate (the node's typed protocol: each method's params and result are its messages), for macOS and Linux
+(Apple silicon, Intel and ARM).
 
 ## Commands
 
