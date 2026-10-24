@@ -37,8 +37,8 @@ fn cli_part_when(node: &StandIn, test: impl Fn(&Value) -> bool) -> Value {
 fn a_missing_cli_is_installed_from_elevenlabs_release() {
     let server = Server::start();
     let node = bare(&release(&server, None));
-    let cli = cli_part_when(&node, |p| p["state"] == "ok");
-    assert_eq!((cli["state"].as_str(), cli["version"].as_str()), (Some("ok"), Some("9.9.9")), "{cli}");
+    let cli = cli_part_when(&node, |p| p["state"] == "STATE_OK");
+    assert_eq!((cli["state"].as_str(), cli["version"].as_str()), (Some("STATE_OK"), Some("9.9.9")), "{cli}");
     let why = cli["why"].as_str().unwrap();
     assert!(why.starts_with("9.9.9, ElevenLabs' release build, installed by the extension at"), "{why}");
     let installed = node.state_dir_path().join("cli/9.9.9/elevenlabs");
@@ -57,8 +57,8 @@ fn a_bad_checksum_is_refused() {
     let server = Server::start();
     let node = bare(&release(&server, Some(&"0".repeat(64))));
     let cli = cli_part_when(&node, |p| p["why"].as_str().is_some_and(|w| w.contains("sha256")));
-    assert_eq!(cli["state"], "failing");
-    assert_eq!(cli["needs"], json!(["update"]));
+    assert_eq!(cli["state"], "STATE_FAILING");
+    assert_eq!(cli["needs"], json!(["ACTION_UPDATE"]));
     assert!(cli["why"].as_str().unwrap().contains("doesn't match its published sha256: not installed"), "{cli}");
     assert!(!node.state_dir_path().join("cli/current").exists(), "nothing installed");
     let failed = node.run("elevenlabs.usage", json!({})).unwrap_err();
