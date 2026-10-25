@@ -14,6 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context};
 use elevenlabs::cli::{self, Call, Found, Ran};
 use elevenlabs::{args, install, words};
+use pointman_extension::protocol::output_request::Role;
+use pointman_extension::protocol::{HealthCheckRequest, HealthCheckResponse, HealthFixRequest, HealthFixResponse};
+use pointman_extension::v1::health::part::State;
+use pointman_extension::v1::health::{Action, Part};
 use pointman_extension::{Extension, Handle, Job};
 use serde_json::{json, Value};
 
@@ -34,11 +38,11 @@ fn now() -> i64 {
 }
 
 fn state(h: &Handle) -> PathBuf {
-    PathBuf::from(h.node()["state_dir"].as_str().unwrap_or_default())
+    h.state_dir()
 }
 
 fn machine(h: &Handle) -> String {
-    h.node()["machine"].as_str().filter(|m| !m.is_empty()).unwrap_or("this machine").to_string()
+    h.machine()
 }
 
 /// A folder of the extension's own to run the CLI in, outside any job (health, credits).
@@ -114,11 +118,9 @@ impl std::fmt::Display for NoKey {
 impl std::error::Error for NoKey {}
 
 fn key(h: &Handle) -> Result<Key, NoKey> {
-    let listed = h
-        .request("secret.list", json!({"prefix": "elevenlabs."}))
+    let mut names = h
+        .secrets("elevenlabs.")
         .map_err(|e| NoKey::Other(format!("couldn't ask the node for the vault's ElevenLabs keys: {e:#}")))?;
-    let mut names: Vec<String> =
-        listed["names"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
     names.sort();
     let wanted = h.settings()["account"].as_str().map(str::trim).unwrap_or_default().to_string();
     let name = if wanted.is_empty() {
@@ -409,7 +411,7 @@ fn isolate(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         bail!("ElevenLabs gave no audio for {name}");
     }
     job.progress(1.0, "posting the isolated audio");
-    job.output(&out, "audio", "main", json!({"file": name, "credits": credits.used}));
+    job.output(&out, "audio", Role::Main, json!({"file": name, "credits": credits.used}));
     Ok(json!({
         "text": format!("Isolated the voice in {name} in {}: {}. {}", words::took(started.elapsed()), name_of(&out), credits.line()),
         "file": out,
@@ -476,7 +478,7 @@ fn tts(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     if std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) == 0 {
         bail!("ElevenLabs gave no audio");
     }
-    job.output(&out, "audio", "main", json!({"file": "tts", "voice": name, "credits": credits.used}));
+    job.output(&out, "audio", Role::Main, json!({"file": "tts", "voice": name, "credits": credits.used}));
     Ok(json!({
         "text": format!("Spoke {} characters as {name}: {}. {}", text.chars().count(), name_of(&out), credits.line()),
         "voice": {"name": name, "id": id},
@@ -511,8 +513,8 @@ fn stt(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     std::fs::write(&txt, format!("{text}\n"))?;
     std::fs::write(&full, serde_json::to_vec_pretty(&got)?)?;
     let meta = json!({"file": name, "credits": credits.used});
-    job.output(&txt, "document", "main", meta.clone());
-    job.output(&full, "document", "main", meta);
+    job.output(&txt, "document", Role::Main, meta.clone());
+    job.output(&full, "document", Role::Main, meta);
     let language = got["language_code"].as_str().unwrap_or("unknown").to_string();
     Ok(json!({
         "text": format!(
@@ -546,7 +548,7 @@ fn align(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     let aligned = got["words"].as_array().cloned().unwrap_or_default();
     let out = r.work.join(format!("{}-alignment.json", words::stem(&name)));
     std::fs::write(&out, serde_json::to_vec_pretty(&got)?)?;
-    job.output(&out, "document", "main", json!({"file": name, "credits": credits.used}));
+    job.output(&out, "document", Role::Main, json!({"file": name, "credits": credits.used}));
     let first: Vec<String> = aligned
         .iter()
         .take(8)
@@ -691,7 +693,7 @@ fn run(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     for f in &made {
         let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let kind = if AUDIO.contains(&ext.as_str()) { "audio" } else { "document" };
-        job.output(f, kind, "main", json!({"file": "run"}));
+        job.output(f, kind, Role::Main, json!({"file": "run"}));
     }
     let out = String::from_utf8_lossy(&ran.stdout).trim().to_string();
     let parsed = ran.json();
@@ -729,18 +731,16 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Health's two parts: the CLI (its version and where it came from) and the key (with the account's credits).
-fn health(x: &Ext) -> Value {
+fn health(x: &Ext) -> Vec<Part> {
     let h = &x.h;
     let scratch = scratch(h);
     let found = find(h);
+    let cli_is =
+        |state: State, needs: Vec<Action>, why: String| health_part("cli", "cli", "ElevenLabs CLI", state, needs, why);
     let cli_part = match &found {
         Some(f) => match cli::version(&f.path, &scratch) {
-            Ok(v) => {
-                json!({"id": "cli", "kind": "cli", "name": "ElevenLabs CLI", "version": v, "state": "ok", "needs": [],
-                            "why": format!("{v}, {}", f.origin())})
-            }
-            Err(e) => json!({"id": "cli", "kind": "cli", "name": "ElevenLabs CLI", "state": "failing", "needs": [],
-                             "why": format!("{} doesn't run: {e:#}", f.origin())}),
+            Ok(v) => Part { version: Some(v.clone()), ..cli_is(State::Ok, vec![], format!("{v}, {}", f.origin())) },
+            Err(e) => cli_is(State::Failing, vec![], format!("{} doesn't run: {e:#}", f.origin())),
         },
         None => {
             let why = match lock_try(&x.installing) {
@@ -748,15 +748,17 @@ fn health(x: &Ext) -> Value {
                 Some(Some(e)) => e,
                 Some(None) => "not on this machine: the extension installs ElevenLabs' release build".to_string(),
             };
-            json!({"id": "cli", "kind": "cli", "name": "ElevenLabs CLI", "state": "failing", "needs": ["update"], "why": why})
+            cli_is(State::Failing, vec![Action::Update], why)
         }
     };
-    let part = |state: &str, needs: Vec<&str>, why: String| json!({"id": "key", "kind": "account", "name": "ElevenLabs key", "state": state, "needs": needs, "why": why});
+    let part = |state: State, needs: Vec<Action>, why: String| {
+        health_part("key", "account", "ElevenLabs key", state, needs, why)
+    };
     let key_part = match key(h) {
-        Err(NoKey::None(why)) => part("failing", vec!["auth"], why),
-        Err(NoKey::Other(why)) => part("unknown", vec![], why),
+        Err(NoKey::None(why)) => part(State::Failing, vec![Action::Auth], why),
+        Err(NoKey::Other(why)) => part(State::Unspecified, vec![], why),
         Ok(k) => match &found {
-            None => part("unknown", vec![], format!("{}: waiting for the CLI to read the account", k.name)),
+            None => part(State::Unspecified, vec![], format!("{}: waiting for the CLI to read the account", k.name)),
             Some(f) => {
                 let mut kept = lock(&x.account);
                 let fresh = kept.as_ref().filter(|(at, name, _)| at.elapsed() < ACCOUNT_KEPT && *name == k.name);
@@ -770,7 +772,7 @@ fn health(x: &Ext) -> Value {
                 };
                 match read {
                     Ok(a) => part(
-                        "ok",
+                        State::Ok,
                         vec![],
                         format!(
                             "{}: {} plan, {} of {} credits left",
@@ -780,13 +782,25 @@ fn health(x: &Ext) -> Value {
                             words::thousands(a.limit)
                         ),
                     ),
-                    Err(why) if why.contains("refused the key") => part("failing", vec!["auth"], why),
-                    Err(why) => part("unknown", vec![], format!("couldn't read the account: {why}")),
+                    Err(why) if why.contains("refused the key") => part(State::Failing, vec![Action::Auth], why),
+                    Err(why) => part(State::Unspecified, vec![], format!("couldn't read the account: {why}")),
                 }
             }
         },
     };
-    json!([cli_part, key_part])
+    vec![cli_part, key_part]
+}
+
+fn health_part(id: &str, kind: &str, name: &str, state: State, needs: Vec<Action>, why: String) -> Part {
+    Part {
+        id: id.into(),
+        kind: kind.into(),
+        name: Some(name.into()),
+        state: state.into(),
+        needs: needs.into_iter().map(Into::into).collect(),
+        why: Some(why),
+        ..Default::default()
+    }
 }
 
 /// The install's last error, or None while one is going.
@@ -798,15 +812,15 @@ fn lock_try(m: &Mutex<Option<String>>) -> Option<Option<String>> {
     }
 }
 
-fn fix(x: &Ext, params: &Value) -> anyhow::Result<Value> {
-    let message = match (params["part"].as_str(), params["action"].as_str()) {
-        (Some("key"), Some("auth")) => {
+fn fix(x: &Ext, fix: &HealthFixRequest) -> anyhow::Result<HealthFixResponse> {
+    let message = match (fix.part.as_str(), fix.action.as_known()) {
+        ("key", Some(Action::Auth)) => {
             *lock(&x.account) = None;
             "Add an ElevenLabs API key with /elevenlabs add in any thread: the app opens a form, so it never goes in a \
              post. It's on elevenlabs.io: Developers › API Keys."
                 .to_string()
         }
-        (Some("cli"), Some("update")) => match find(&x.h) {
+        ("cli", Some(Action::Update)) => match find(&x.h) {
             Some(f) if f.from != cli::From::Installed => {
                 format!("The CLI in use is {}: update it there (Homebrew's: brew upgrade elevenlabs).", f.origin())
             }
@@ -819,7 +833,7 @@ fn fix(x: &Ext, params: &Value) -> anyhow::Result<Value> {
         },
         _ => "Nothing to fix from here.".to_string(),
     };
-    Ok(json!({"message": message}))
+    Ok(HealthFixResponse { message, ..Default::default() })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -859,9 +873,9 @@ fn main() -> anyhow::Result<()> {
     });
 
     let xh = x.clone();
-    ext.method("health.check", move |_| Ok(health(&xh)));
+    ext.on(move |_: HealthCheckRequest| Ok(HealthCheckResponse { parts: health(&xh), ..Default::default() }));
     let xf = x.clone();
-    ext.method("health.fix", move |params: Value| fix(&xf, &params));
+    ext.on(move |req: HealthFixRequest| fix(&xf, &req));
 
     ext.run()
 }

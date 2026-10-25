@@ -188,7 +188,13 @@ pub fn node(fake: &Fake, secrets: &[(&str, &str)], roots: &[&Path]) -> StandIn {
 /// health.check's part `id`.
 pub fn part(node: &StandIn, id: &str) -> Value {
     let parts = node.call("health.check", json!({})).unwrap();
-    parts.as_array().unwrap().iter().find(|p| p["id"] == id).cloned().unwrap_or_else(|| panic!("no {id} in {parts}"))
+    parts["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {id} in {parts}"))
 }
 
 /// Every file under `dir`, recursively.

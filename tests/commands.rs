@@ -4,9 +4,12 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::*;
+use pointman_extension::convert::from_struct;
+use pointman_extension::protocol::output_request::Role;
 use pointman_extension::testing::RunOptions;
 use serde_json::{json, Value};
 
@@ -22,7 +25,7 @@ fn the_key_is_in_the_calls_environment_only() {
     let calls = fake.calls();
     let isolate = calls.iter().find(|c| c.is("audio-isolation", "convert")).expect("the isolate's call");
     assert_eq!(isolate.key, KEY);
-    assert_eq!(isolate.via, "pointman-elevenlabs/0.1.0");
+    assert_eq!(isolate.via, "pointman-elevenlabs/0.2.0");
     for c in &calls {
         assert!(c.args.iter().all(|a| !a.contains(KEY)), "the key in args: {:?}", c.args);
         let state = node.state_dir_path().canonicalize().unwrap();
@@ -85,10 +88,10 @@ fn isolate_reports_progress_posts_the_audio_and_its_credits() {
     assert!(stages.iter().any(|s| s.ends_with("so far")), "{stages:?}");
     assert_eq!(done.outputs.len(), 1);
     let out = &done.outputs[0];
-    assert_eq!((out.kind.as_str(), out.role.as_str()), ("audio", "main"));
-    assert!(out.path.ends_with("talk-isolated.mp3"), "{}", out.path.display());
+    assert_eq!((out.kind.as_str(), out.role), ("audio", Role::Main.into()));
+    assert!(out.path.ends_with("talk-isolated.mp3"), "{}", out.path);
     assert_eq!(std::fs::read(&out.path).unwrap(), b"ID3isolated");
-    assert_eq!(out.meta["file"], "talk.wav");
+    assert_eq!(from_struct(&out.meta)["file"], "talk.wav");
     assert_eq!(done.result["credits"], json!({"used": 333, "left": 98_667, "shared": false, "pending": false}));
     let text = done.result["text"].as_str().unwrap();
     assert!(
@@ -149,8 +152,8 @@ fn no_key_is_health_failing_with_auth() {
     let (folder, file) = media();
     let node = node(&fake, &[], &[folder.path()]);
     let key = part(&node, "key");
-    assert_eq!(key["state"], "failing");
-    assert_eq!(key["needs"], json!(["auth"]));
+    assert_eq!(key["state"], "STATE_FAILING");
+    assert_eq!(key["needs"], json!(["ACTION_AUTH"]));
     assert!(key["why"].as_str().unwrap().contains("/elevenlabs add"), "{key}");
     let failed = node.run("elevenlabs.isolate", json!({"file": file})).unwrap_err();
     assert!(failed.message.contains("/elevenlabs add"), "{failed}");
@@ -164,7 +167,7 @@ fn a_refused_key_is_named() {
     let (folder, file) = media();
     let node = node(&fake, &[("elevenlabs.old", REFUSED)], &[folder.path()]);
     let key = part(&node, "key");
-    assert_eq!((key["state"].as_str(), &key["needs"]), (Some("failing"), &json!(["auth"])));
+    assert_eq!((key["state"].as_str(), &key["needs"]), (Some("STATE_FAILING"), &json!(["ACTION_AUTH"])));
     assert!(key["why"].as_str().unwrap().contains("refused the key in elevenlabs.old"), "{key}");
     let failed = node.run("elevenlabs.isolate", json!({"file": file})).unwrap_err();
     assert!(failed.message.contains("refused the key in elevenlabs.old"), "{failed}");
@@ -177,10 +180,10 @@ fn health_says_the_clis_version_and_the_accounts_credits() {
     let fake = Fake::new();
     let node = node(&fake, &[("elevenlabs.main", KEY), ("elevenlabs.spare", "sk_other00000000000000000000")], &[]);
     let cli = part(&node, "cli");
-    assert_eq!((cli["state"].as_str(), cli["version"].as_str()), (Some("ok"), Some("9.9.9")));
+    assert_eq!((cli["state"].as_str(), cli["version"].as_str()), (Some("STATE_OK"), Some("9.9.9")));
     assert!(cli["why"].as_str().unwrap().starts_with("9.9.9, the `cli` setting's"), "{cli}");
     let key = part(&node, "key");
-    assert_eq!(key["state"], "ok");
+    assert_eq!(key["state"], "STATE_OK");
     assert_eq!(key["why"], "elevenlabs.main: creator plan, 99,000 of 100,000 credits left");
 }
 
@@ -224,7 +227,7 @@ fn stt_posts_the_transcript_and_align_the_word_timings() {
     let done = node.run("elevenlabs.stt", json!({"file": file})).unwrap();
     assert_eq!((done.result["words"].as_u64(), done.result["language"].as_str()), (Some(2), Some("en")));
     let names: Vec<String> =
-        done.outputs.iter().map(|o| o.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        done.outputs.iter().map(|o| Path::new(&o.path).file_name().unwrap().to_string_lossy().into_owned()).collect();
     assert_eq!(names, ["talk-transcript.txt", "talk-transcript.json"]);
     assert!(done.outputs.iter().all(|o| o.kind == "document"));
     assert_eq!(std::fs::read_to_string(&done.outputs[0].path).unwrap(), "hello world\n");
