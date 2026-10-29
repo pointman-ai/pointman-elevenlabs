@@ -25,7 +25,7 @@ fn the_key_is_in_the_calls_environment_only() {
     let calls = fake.calls();
     let isolate = calls.iter().find(|c| c.is("audio-isolation", "convert")).expect("the isolate's call");
     assert_eq!(isolate.key, KEY);
-    assert_eq!(isolate.via, "pointman-elevenlabs/0.3.0");
+    assert_eq!(isolate.via, concat!("pointman-elevenlabs/", env!("CARGO_PKG_VERSION")));
     for c in &calls {
         assert!(c.args.iter().all(|a| !a.contains(KEY)), "the key in args: {:?}", c.args);
         let state = node.state_dir_path().canonicalize().unwrap();
