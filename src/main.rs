@@ -94,11 +94,46 @@ struct Key {
     value: String,
 }
 
-/// The key as pasted, without what's often pasted around it (`ELEVENLABS_API_KEY=`, quotes, spaces).
+/// The key in what the node gives: by its own pattern (`sk_…`, or an older 32-hex key) wherever it sits, since the
+/// node hands over the vault's sealed record as it is (`{"kind":"env","vars":{"elevenlabs.main":"sk_…"}}`), and a
+/// pasted `ELEVENLABS_API_KEY=` line or quotes are around it too. Anything else as pasted, without those.
 fn key_of(pasted: &str) -> String {
+    if let Some(key) = sk_key(pasted).or_else(|| hex_key(pasted)) {
+        return key.to_string();
+    }
     let v = pasted.trim();
     let v = v.rsplit_once('=').map_or(v, |(_, k)| k);
     v.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string()
+}
+
+/// `sk_` and 20 to 200 letters and digits, not inside a longer word (the credential form's own pattern).
+fn sk_key(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(at) = s[from..].find("sk_").map(|i| i + from) {
+        let len = b[at + 3..].iter().take_while(|c| c.is_ascii_alphanumeric()).count();
+        if (at == 0 || !b[at - 1].is_ascii_alphanumeric()) && (20..=200).contains(&len) {
+            return Some(&s[at..at + 3 + len]);
+        }
+        from = at + 3;
+    }
+    None
+}
+
+/// 32 lowercase hex digits on their own: an older ElevenLabs key.
+fn hex_key(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    let mut at = 0;
+    while at < b.len() {
+        let len = b[at..].iter().take_while(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')).count();
+        let alone = (at == 0 || !b[at - 1].is_ascii_alphanumeric())
+            && b.get(at + len).is_none_or(|c| !c.is_ascii_alphanumeric());
+        if len == 32 && alone {
+            return Some(&s[at..at + len]);
+        }
+        at += len.max(1);
+    }
+    None
 }
 
 #[derive(Debug)]
@@ -888,6 +923,18 @@ mod tests {
     fn a_pasted_key_is_only_the_key() {
         assert_eq!(key_of("  sk_abc123\n"), "sk_abc123");
         assert_eq!(key_of("ELEVENLABS_API_KEY=\"sk_abc123\""), "sk_abc123");
+    }
+
+    #[test]
+    fn the_key_comes_out_of_the_vaults_sealed_record() {
+        let key = format!("sk_{}", "a1B2c3D4".repeat(6));
+        let sealed = format!(r#"{{"kind":"env","vars":{{"elevenlabs.main":"{key}"}}}}"#);
+        assert_eq!(key_of(&sealed), key);
+        assert_eq!(key_of(&format!("ELEVENLABS_API_KEY={key}\n")), key);
+        let old = "0123456789abcdef0123456789abcdef";
+        assert_eq!(key_of(&format!(r#"{{"kind":"env","vars":{{"elevenlabs.old":"{old}"}}}}"#)), old);
+        assert_eq!(sk_key("task_0123456789abcdefghij"), None, "not inside a longer word");
+        assert_eq!(hex_key(&format!("{old}0")), None, "33 hex digits aren't a key");
     }
 
     #[test]
