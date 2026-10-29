@@ -6,7 +6,7 @@
 [extension]
 id = "elevenlabs"
 name = "ElevenLabs"
-version = "0.3.0"
+version = "0.3.1"
 publisher = "aurelio"
 summary = "ElevenLabs' CLI on this machine: voice isolation, text to speech, transcripts, word timings, voices and credits."
 node = ">=0.4.0"
