@@ -87,6 +87,7 @@ it came from. Its `update` fix installs the newest again, for the extension's ow
   `[HH:MM:SS UTC] 2 min, no words.`, and a chunk that couldn't be transcribed gets `Couldn't hear 15 s of the
   stream: <why>` (at most one such line every 2 min). Each chunk's outcome (words, seconds to transcribe) is in
   the extension's log, and the closing post counts the chunks with no words.
+- **A microphone, directly:** `url: "mic:<name or index>"` hears this Mac's microphone with no stream's delay (macOS, through ffmpeg's avfoundation), and `camera` names a camera for its stills. `ffmpeg -f avfoundation -list_devices true -i ""` lists both. The first time, macOS asks to allow the microphone.
 - **Stills** are taken as their frames arrive (`select`, one encoder thread), so each shows what was on screen
   when it was posted, not up to a minute before.
 - **`transcript.jsonl`:** one line a post, `{t_utc, start_s, end_s, text, post}`; `start_s` and `end_s` count
