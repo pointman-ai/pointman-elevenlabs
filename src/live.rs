@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn a_chunk_is_cut_in_its_pause() {
         // 15 s of "speech" with a quiet 200 ms at 13.5 s
-        let mut s: Vec<i16> = (0..15 * RATE).map(|i| if i % 2 == 0 { 8000 } else { -8000 }).collect();
+        let mut s: Vec<i16> = (0..15 * RATE).map(|i| if i.is_multiple_of(2) { 8000 } else { -8000 }).collect();
         let quiet = (13.5 * RATE as f64) as usize;
         for x in &mut s[quiet..quiet + RATE / 5] {
             *x = 10;
