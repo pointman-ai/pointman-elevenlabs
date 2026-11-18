@@ -1,6 +1,6 @@
 ---
 name: elevenlabs
-description: ElevenLabs through the elevenlabs extension: voice isolation, text to speech, transcripts, word timings, voices and credits, with the vault's key.
+description: ElevenLabs through the elevenlabs extension: voice isolation, text to speech, transcripts, live streams heard into a thread, word timings, voices and credits, with the vault's key.
 ---
 
 # ElevenLabs
@@ -15,6 +15,7 @@ you never run `elevenlabs auth` or write a `.env`.
 | Speech from text | `elevenlabs.tts {text, voice, model?}` | audio, posted back |
 | A transcript | `elevenlabs.stt {file, model?, language?}` | `.txt` and `.json` (word timings), posted back |
 | Word timings for a script you have | `elevenlabs.align {file, text}` | `.json`, posted back |
+| Hear a live stream (a YouTube live) | `elevenlabs.live {url, thread, every_seconds?: 15, stills_every_seconds?: 60, language?, minutes?: 120}` | `[HH:MM:SS UTC] words` posts in `thread`, stills, `transcript.jsonl` |
 | Which voices there are | `elevenlabs.voices {search?}` | names and ids |
 | Credits used and left | `elevenlabs.usage` | the plan, used, left, reset day |
 | Anything else in the CLI | `elevenlabs.run {args, dry_run, confirm?, file?}` | its output |
@@ -24,6 +25,9 @@ you never run `elevenlabs auth` or write a `.env`.
   cancelled.
 - **Credits first.** Before a long job (isolating or transcribing many minutes), run `elevenlabs.usage`.
   Each paid command says what it used and what's left.
+- **`live` runs until `minutes`** or until it's cancelled, and spends credits all the while (batch speech to
+  text on each chunk): give `minutes` for a test, and cancel it when the stream is over. Posts lag the speaker
+  by about `every_seconds` plus a few seconds. A dropped stream is tried again every 10 s, with a line saying so.
 - **`voice`** is a name from `elevenlabs.voices` (or the start of one) or a voice id.
 - **`run` is a dry run unless `dry_run: false`.** Do the dry run first and read the request it shows.
   Anything that deletes, removes, disables or clones also needs `confirm: true`. Ask your person first.
