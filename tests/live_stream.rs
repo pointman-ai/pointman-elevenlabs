@@ -43,10 +43,10 @@ fn clip_as(ffmpeg: &Path, dir: &Path, seconds: u32, name: &str) -> PathBuf {
 type Posted = Arc<Mutex<Vec<(String, Value)>>>;
 
 fn listening_node(fake: &Fake, roots: &[&Path], posted: &Posted) -> StandIn {
-    listening_node_with(fake, roots, posted, json!({"cli": fake.path().to_string_lossy()}))
+    listening_node_with(roots, posted, json!({"cli": fake.path().to_string_lossy()}))
 }
 
-fn listening_node_with(fake: &Fake, roots: &[&Path], posted: &Posted, settings: Value) -> StandIn {
+fn listening_node_with(roots: &[&Path], posted: &Posted, settings: Value) -> StandIn {
     let (p1, p2) = (posted.clone(), posted.clone());
     StandIn::new(ROOT)
         .binary(env!("CARGO_BIN_EXE_elevenlabs"))
@@ -154,7 +154,7 @@ fn a_stream_that_hasnt_started_is_waited_for() {
     std::fs::set_permissions(&ytdlp, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let posted: Posted = Arc::default();
     let settings = json!({"cli": fake.path().to_string_lossy(), "yt_dlp": ytdlp.to_string_lossy()});
-    let node = listening_node_with(&fake, &[folder.path()], &posted, settings);
+    let node = listening_node_with(&[folder.path()], &posted, settings);
 
     let params = json!({"url": "https://www.youtube.com/watch?v=x", "thread": "thr_7", "every_seconds": 5, "stills_every_seconds": 0, "minutes": 1});
     let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs(90)).unwrap();
