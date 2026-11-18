@@ -884,8 +884,14 @@ fn ffmpeg_args(input: &Input, stills: Option<(&Path, f64)>) -> Vec<String> {
     a.extend(["-map", sound, "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"].map(String::from));
     if let Some((dir, every)) = stills {
         a.extend(["-map".into(), "0:v:0?".into(), "-an".into(), "-vf".into()]);
-        a.push(format!("fps=1/{every},scale='min(1280,iw)':-2"));
-        a.extend(["-q:v", "4", "-f", "image2", "-atomic_writing", "1"].map(String::from));
+        // each still the moment its frame arrives: `fps=1/N` holds a frame until the next one's slot, and the
+        // encoder's frame threads hold it longer, so a still showed what was on screen up to N s before it was
+        // written (a still every 60 s was 30–60 s old). `select` takes the frame as it comes; one thread writes it
+        a.push(format!("select='isnan(prev_selected_t)+gte(t-prev_selected_t,{every})',scale='min(1280,iw)':-2"));
+        a.extend(
+            ["-fps_mode", "vfr", "-threads", "1", "-q:v", "4", "-f", "image2", "-atomic_writing", "1"]
+                .map(String::from),
+        );
         a.push(dir.join("still-%05d.jpg").to_string_lossy().into_owned());
     }
     a
@@ -910,6 +916,17 @@ enum Said {
 /// dropped stream is tried again.
 const STALL: Duration = Duration::from_secs(30);
 const RECONNECT: Duration = Duration::from_secs(10);
+/// How much of the stream with no words is said in the thread as one line: "2 min, no words."
+const QUIET_LINE: Duration = Duration::from_secs(120);
+
+/// [`QUIET_LINE`], or POINTMAN_ELEVENLABS_QUIET_SECS for a test.
+fn quiet_line() -> Duration {
+    std::env::var("POINTMAN_ELEVENLABS_QUIET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map(Duration::from_secs_f64)
+        .unwrap_or(QUIET_LINE)
+}
 
 /// [`RECONNECT`], or POINTMAN_ELEVENLABS_RETRY_MS for a test that can't wait 10 s a try.
 fn reconnect() -> Duration {
@@ -938,6 +955,10 @@ struct Heard {
     posts: usize,
     words: usize,
     quiet: usize,
+    /// Seconds of the stream heard since the last words, or since the last line saying there were none.
+    quiet_run: f64,
+    /// When a chunk that couldn't be heard was last said in the thread.
+    failed_said: Option<Instant>,
     stills: usize,
     drops: usize,
     lag: live::Lags,
@@ -1006,11 +1027,28 @@ impl Ear {
             if let Err(e) = self.one(n, &chunk) {
                 let e = format!("{e:#}");
                 self.h.log(format!("live: chunk {n}: {e}"));
-                let mut heard = lock(&self.heard);
-                if e.contains("refused the key") {
-                    heard.refused = Some(e.clone());
+                let say = {
+                    let mut heard = lock(&self.heard);
+                    if e.contains("refused the key") {
+                        heard.refused = Some(e.clone());
+                    }
+                    heard.error(e.clone());
+                    // a fault is said in the thread, at most once every QUIET_LINE, so it's never taken for quiet
+                    let due = heard.failed_said.is_none_or(|at| at.elapsed() >= quiet_line());
+                    if due {
+                        heard.failed_said = Some(Instant::now());
+                    }
+                    due
+                };
+                if say {
+                    let secs = chunk.samples.len() / live::RATE;
+                    let line = format!(
+                        "[{} UTC] Couldn't hear {secs} s of the stream: {}",
+                        live::clock(live::unix(SystemTime::now())),
+                        cli::clip(&e, 200)
+                    );
+                    let _ = board_post(&self.h, self.thread, &line);
                 }
-                heard.error(e);
             }
         }
     }
@@ -1048,10 +1086,23 @@ impl Ear {
         let got = ran.json().context("ElevenLabs' transcript wasn't JSON")?;
         let (said, text) = live::words_of(&got);
         let sample = |s: f64| chunk.start + (s.max(0.0) * live::RATE as f64) as u64;
+        self.h.log(format!("live: chunk {n}: {} words, {stt:.1} s to transcribe", said.len()));
         let (Some(first), Some(last)) = (said.first(), said.last()) else {
-            let mut heard = lock(&self.heard);
-            heard.quiet += 1;
-            heard.stt.add(stt);
+            // no words: a pause, music, or a silent stream. Every QUIET_LINE of them is said in the thread, so a quiet
+            // stretch can be told from a fault
+            let line = {
+                let mut heard = lock(&self.heard);
+                heard.quiet += 1;
+                heard.stt.add(stt);
+                heard.quiet_run += chunk.samples.len() as f64 / live::RATE as f64;
+                (heard.quiet_run >= quiet_line().as_secs_f64()).then(|| std::mem::take(&mut heard.quiet_run))
+            };
+            if let Some(quiet) = line {
+                let end = chunk.start + chunk.samples.len() as u64;
+                let at = chunk.arrivals.at(end).unwrap_or_else(|| live::unix(SystemTime::now()));
+                let minutes = (quiet / 60.0).floor().max(1.0);
+                board_post(&self.h, self.thread, &format!("[{} UTC] {minutes} min, no words.", live::clock(at)))?;
+            }
             return Ok(());
         };
         let first_at = chunk.arrivals.at(sample(first.start)).unwrap_or_else(|| live::unix(SystemTime::now()));
@@ -1068,6 +1119,7 @@ impl Ear {
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.transcript)?;
         writeln!(f, "{row}")?;
         let mut heard = lock(&self.heard);
+        heard.quiet_run = 0.0;
         heard.posts += 1;
         heard.words += said.len();
         heard.stt.add(stt);
@@ -1449,12 +1501,13 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     };
     let title = lock(&title).clone();
     let summary = format!(
-        "Stopped listening to {title}: {stopped}. Heard {}: {} posts, {} words, {} stills{}; {lag}. {}",
+        "Stopped listening to {title}: {stopped}. Heard {}: {} posts, {} words, {} stills{}{}; {lag}. {}",
         words::took(Duration::from_secs(seconds)),
         h.posts,
         h.words,
         h.stills,
         if h.drops > 0 { format!(", {} drops", h.drops) } else { String::new() },
+        if h.quiet > 0 { format!(", {} chunks with no words", h.quiet) } else { String::new() },
         credits.line()
     );
     if let Err(e) = board_post(&x.h, thread, &summary) {
@@ -1662,6 +1715,20 @@ mod tests {
         assert_eq!(Credits::default().line(), "The credits it used couldn't be read.");
         let late = Credits { used: None, left: Some(99_000), shared: false, pending: true };
         assert!(late.line().starts_with("ElevenLabs hadn't counted its credits 20 s after it finished (99,000 left"));
+    }
+
+    #[test]
+    fn stills_are_taken_as_their_frames_come() {
+        let input =
+            Input { urls: vec!["https://x/index.m3u8".into()], live: Some(true), title: None, whitelist: "https" };
+        let a = ffmpeg_args(&input, Some((Path::new("/w/stills"), 60.0)));
+        let vf = a.iter().position(|x| x == "-vf").map(|i| a[i + 1].clone()).unwrap();
+        assert!(vf.starts_with("select='isnan(prev_selected_t)+gte(t-prev_selected_t,60)'"), "{vf}");
+        let threads = a.iter().position(|x| x == "-threads").unwrap();
+        assert_eq!(a[threads + 1], "1", "one encoder thread, so a still isn't held back: {a:?}");
+        assert!(a.windows(2).any(|w| w == ["-live_start_index", "-1"]));
+        assert!(!a.iter().any(|x| x.starts_with("fps=")), "{a:?}");
+        assert!(ffmpeg_args(&input, None).iter().all(|x| x != "-vf"));
     }
 
     #[test]

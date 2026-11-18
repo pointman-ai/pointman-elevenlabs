@@ -67,6 +67,7 @@ case "$1 $2" in
     printf 'ID3sfx' > "${out:-sfx.mp3}"; spend 100; echo '{"status": "success"}';;
   "speech-to-text convert")
     spend 50
+    if [ -f "$here/quiet" ]; then echo '{"language_code": "en", "text": "", "words": []}'; exit 0; fi
     echo '{"language_code": "en", "text": "hello world", "words": [{"text": "hello", "start": 0.0, "end": 0.4, "type": "word"}, {"text": " ", "start": 0.4, "end": 0.5, "type": "spacing"}, {"text": "world", "start": 0.5, "end": 0.9, "type": "word"}]}';;
   "forced-alignment create")
     spend 20
@@ -113,6 +114,11 @@ impl Fake {
     /// ElevenLabs counts each call's credits a little late: at the second read after it.
     pub fn bills_late(&self) {
         std::fs::write(self.dir.path().join("late"), "").unwrap();
+    }
+
+    /// Its speech to text hears no words, as in music or silence.
+    pub fn hears_nothing(&self) {
+        std::fs::write(self.dir.path().join("quiet"), "").unwrap();
     }
 
     /// How long its isolate takes, in seconds.

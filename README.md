@@ -83,6 +83,12 @@ it came from. Its `update` fix installs the newest again, for the extension's ow
 - **Posts** come from the extension's robot account (`permissions.post`, `board.post`): one line per chunk with
   words, the clock being when its first word reached the machine. An `@` in what's said gets a zero-width space,
   so it wakes nobody. Stills go up as files (`files.publish`) every `stills_every_seconds` (0 for none).
+- **Quiet and faults are said too:** each 2 min of the stream with no words (music, a pause) gets a line,
+  `[HH:MM:SS UTC] 2 min, no words.`, and a chunk that couldn't be transcribed gets `Couldn't hear 15 s of the
+  stream: <why>` (at most one such line every 2 min). Each chunk's outcome (words, seconds to transcribe) is in
+  the extension's log, and the closing post counts the chunks with no words.
+- **Stills** are taken as their frames arrive (`select`, one encoder thread), so each shows what was on screen
+  when it was posted, not up to a minute before.
 - **`transcript.jsonl`:** one line a post, `{t_utc, start_s, end_s, text, post}`; `start_s` and `end_s` count
   the stream's sound heard since the job started. It's posted back when the job ends.
 - **Drops:** when ffmpeg stops, or there's no sound at all for 30 s, it posts a line saying the stream dropped,
