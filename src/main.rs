@@ -6,18 +6,24 @@
 //! into that call's environment only. A paid call reads the account's credits before and after, and says what it
 //! used. What it makes goes back as the command's outputs, posted where it was asked.
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use elevenlabs::cli::{self, Call, Found, Ran};
-use elevenlabs::{args, install, words};
+use elevenlabs::{args, install, live, words};
+use pointman_extension::convert::to_struct;
 use pointman_extension::protocol::output_request::Role;
-use pointman_extension::protocol::{HealthCheckRequest, HealthCheckResponse, HealthFixRequest, HealthFixResponse};
+use pointman_extension::protocol::{
+    BoardPostRequest, FilesPublishRequest, HealthCheckRequest, HealthCheckResponse, HealthFixRequest, HealthFixResponse,
+};
 use pointman_extension::v1::health::part::State;
 use pointman_extension::v1::health::{Action, Part};
+use pointman_extension::v1::ThreadRef;
 use pointman_extension::{Extension, Handle, Job};
 use serde_json::{json, Value};
 
@@ -765,6 +771,665 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+// ------------------------------------------------------------------ elevenlabs.live
+
+/// ffmpeg's or yt-dlp's path: the setting's, else the PATH's, else Homebrew's or NixOS's folders (a node's PATH
+/// may reach none of them).
+fn tool(h: &Handle, setting: &str, name: &str) -> Option<PathBuf> {
+    let set = h.settings()[setting].as_str().map(str::trim).unwrap_or_default().to_string();
+    if !set.is_empty() {
+        return Some(PathBuf::from(set));
+    }
+    let on_path: Vec<PathBuf> =
+        std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    on_path
+        .into_iter()
+        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/run/current-system/sw/bin"].map(PathBuf::from))
+        .map(|d| d.join(name))
+        .find(|p| p.is_absolute() && p.is_file())
+}
+
+/// A number param: its default when not given, refused outside `min..=max`.
+fn number(job: &Job, key: &str, default: f64, min: f64, max: f64) -> anyhow::Result<f64> {
+    match &job.params[key] {
+        Value::Null => Ok(default),
+        v => {
+            let n = v.as_f64().with_context(|| format!("{key} is a number"))?;
+            if !(min..=max).contains(&n) {
+                bail!("{key} is from {min} to {max}, not {n}");
+            }
+            Ok(n)
+        }
+    }
+}
+
+/// A program's output, killed when it takes longer than `timeout` or the job is cancelled.
+fn output_of(mut cmd: Command, timeout: Duration, job: &Job) -> anyhow::Result<(bool, String, String)> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut out = child.stdout.take().context("no stdout")?;
+    let mut err = child.stderr.take().context("no stderr")?;
+    let o = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out.read_to_string(&mut s);
+        s
+    });
+    let e = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err.read_to_string(&mut s);
+        s
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if job.cancelled() || started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            job.check()?;
+            bail!("it took longer than {}", words::took(timeout));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok((status.success(), o.join().unwrap_or_default(), e.join().unwrap_or_default()))
+}
+
+/// What ffmpeg reads: its inputs (a stream's picture and sound can be two), and how.
+#[derive(Debug, Clone)]
+struct Input {
+    urls: Vec<String>,
+    /// yt-dlp says whether it's live; a file isn't, and is read at its own pace (`-re`).
+    live: Option<bool>,
+    title: Option<String>,
+    whitelist: &'static str,
+}
+
+/// A page's stream, as yt-dlp finds it: a picture small enough for stills with its sound, else the sound alone.
+fn page_input(ytdlp: &Path, url: &str, job: &Job) -> anyhow::Result<Input> {
+    let mut cmd = Command::new(ytdlp);
+    cmd.args(["--ignore-config", "--no-warnings", "--no-playlist", "-f"])
+        .arg("best[height<=720][acodec!=none][vcodec!=none]/best[acodec!=none]/bestaudio")
+        .args(["--print", "is_live", "--print", "title", "--print", "urls", "--"])
+        .arg(url);
+    let (ok, out, err) = output_of(cmd, Duration::from_secs(90), job).context("asking yt-dlp for the stream")?;
+    if !ok {
+        bail!("yt-dlp couldn't find a stream at {url}: {}", cli::clip(err.trim(), 400));
+    }
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let live = lines.next().map(|l| l == "True");
+    let title = lines.next().map(String::from);
+    let urls: Vec<String> = lines.filter(|l| l.starts_with("http")).map(String::from).collect();
+    if urls.is_empty() {
+        bail!("yt-dlp found no stream's address at {url}");
+    }
+    Ok(Input { urls, live, title, whitelist: live::PROTOCOLS })
+}
+
+/// ffmpeg's arguments: the sound as 16 kHz mono PCM on stdout, and when `stills` says, a still every so many
+/// seconds into that folder, each written whole before it's named (`atomic_writing`).
+fn ffmpeg_args(input: &Input, stills: Option<(&Path, f64)>) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-nostdin", "-loglevel", "error"].map(String::from).to_vec();
+    for url in &input.urls {
+        a.extend(["-protocol_whitelist".into(), input.whitelist.into()]);
+        if input.live == Some(false) {
+            a.push("-re".into());
+        }
+        if url.contains(".m3u8") && input.live != Some(false) {
+            a.extend(["-live_start_index".into(), "-1".into()]);
+        }
+        a.extend(["-i".into(), url.clone()]);
+    }
+    // two inputs: yt-dlp gives the picture first, then the sound
+    let sound = if input.urls.len() > 1 { "1:a:0" } else { "0:a:0" };
+    a.extend(["-map", sound, "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"].map(String::from));
+    if let Some((dir, every)) = stills {
+        a.extend(["-map".into(), "0:v:0?".into(), "-an".into(), "-vf".into()]);
+        a.push(format!("fps=1/{every},scale='min(1280,iw)':-2"));
+        a.extend(["-q:v", "4", "-f", "image2", "-atomic_writing", "1"].map(String::from));
+        a.push(dir.join("still-%05d.jpg").to_string_lossy().into_owned());
+    }
+    a
+}
+
+/// A piece of the stream's sound, for speech to text: where it starts (in samples from the start) and when each
+/// sample reached this machine.
+struct Chunk {
+    start: u64,
+    samples: Vec<i16>,
+    arrivals: live::Arrivals,
+}
+
+/// What the listener hands the transcriber, in order: a chunk to hear, or a line to post as it is (the stream
+/// dropped, or is back).
+enum Said {
+    Chunk(Chunk),
+    Line(String),
+}
+
+/// How long a stream may be silent (no sound at all, not a pause) before it's taken for a drop, and how often a
+/// dropped stream is tried again.
+const STALL: Duration = Duration::from_secs(30);
+const RECONNECT: Duration = Duration::from_secs(10);
+
+/// Wait `d`, or less when the job is cancelled or its time is up: true when it waited the whole time.
+fn wait_for(job: &Job, deadline: Instant, d: Duration) -> bool {
+    let until = Instant::now() + d;
+    while Instant::now() < until {
+        if job.cancelled() || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
+/// What a listen has done so far.
+#[derive(Default)]
+struct Heard {
+    posts: usize,
+    words: usize,
+    quiet: usize,
+    stills: usize,
+    drops: usize,
+    lag: live::Lags,
+    stt: live::Lags,
+    errors: Vec<String>,
+    /// ElevenLabs refused the key: nothing more is sent.
+    refused: Option<String>,
+}
+
+impl Heard {
+    fn error(&mut self, e: String) {
+        if self.errors.len() < 20 {
+            self.errors.push(e);
+        }
+    }
+}
+
+/// A post of the extension's own in `thread`, tried twice.
+fn board_post(h: &Handle, thread: i64, text: &str) -> anyhow::Result<String> {
+    let ask = BoardPostRequest {
+        thread: ThreadRef { id: format!("thr_{thread}"), ..Default::default() }.into(),
+        text: text.to_string(),
+        ..Default::default()
+    };
+    match h.request(&ask) {
+        Ok(a) => Ok(a.post.id.clone()),
+        Err(_) => {
+            std::thread::sleep(Duration::from_secs(2));
+            Ok(h.request(&ask)?.post.id.clone())
+        }
+    }
+}
+
+struct Ear {
+    h: Handle,
+    cli: PathBuf,
+    key: Key,
+    base: String,
+    work: PathBuf,
+    thread: i64,
+    model: String,
+    language: Option<String>,
+    transcript: PathBuf,
+    heard: Arc<Mutex<Heard>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Ear {
+    /// Each chunk to ElevenLabs' speech to text, and its words posted as one line in the thread.
+    fn transcribe(&self, said: mpsc::Receiver<Said>) {
+        let mut n = 0;
+        for said in said {
+            if self.stop.load(Ordering::SeqCst) || lock(&self.heard).refused.is_some() {
+                continue;
+            }
+            let chunk = match said {
+                Said::Chunk(c) => c,
+                Said::Line(line) => {
+                    if let Err(e) = board_post(&self.h, self.thread, &line) {
+                        lock(&self.heard).error(format!("couldn't post {line:?}: {e:#}"));
+                    }
+                    continue;
+                }
+            };
+            n += 1;
+            if let Err(e) = self.one(n, &chunk) {
+                let e = format!("{e:#}");
+                self.h.log(format!("live: chunk {n}: {e}"));
+                let mut heard = lock(&self.heard);
+                if e.contains("refused the key") {
+                    heard.refused = Some(e.clone());
+                }
+                heard.error(e);
+            }
+        }
+    }
+
+    fn one(&self, n: usize, chunk: &Chunk) -> anyhow::Result<()> {
+        let pcm = self.work.join(format!("chunk-{n:05}.pcm"));
+        let bytes: Vec<u8> = chunk.samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        std::fs::write(&pcm, bytes)?;
+        let mut args = vec![
+            "speech-to-text".into(),
+            "convert".into(),
+            format!("--file={}", pcm.display()),
+            "--file-format=pcm_s16le_16".into(),
+            format!("--model-id={}", self.model),
+            "--tag-audio-events=false".into(),
+            "--timestamps-granularity=word".into(),
+            "--format=json".into(),
+        ];
+        if let Some(language) = &self.language {
+            args.push(format!("--language-code={language}"));
+        }
+        let asked = Instant::now();
+        let call = Call::new(&self.cli, &self.work, args)
+            .key(Some(&self.key.value))
+            .via(VIA)
+            .base_url(&self.base)
+            .timeout(Duration::from_secs(120));
+        let ran = cli::run(&call, &|| false, &mut |_| {});
+        let _ = std::fs::remove_file(&pcm);
+        let ran = ran?;
+        if !ran.ok() {
+            return Err(failure(&ran, &self.key));
+        }
+        let stt = asked.elapsed().as_secs_f64();
+        let got = ran.json().context("ElevenLabs' transcript wasn't JSON")?;
+        let (said, text) = live::words_of(&got);
+        let sample = |s: f64| chunk.start + (s.max(0.0) * live::RATE as f64) as u64;
+        let (Some(first), Some(last)) = (said.first(), said.last()) else {
+            let mut heard = lock(&self.heard);
+            heard.quiet += 1;
+            heard.stt.add(stt);
+            return Ok(());
+        };
+        let first_at = chunk.arrivals.at(sample(first.start)).unwrap_or_else(|| live::unix(SystemTime::now()));
+        let post = board_post(&self.h, self.thread, &live::line(first_at, &text))?;
+        let posted = live::unix(SystemTime::now());
+        let at = chunk.start as f64 / live::RATE as f64;
+        let row = json!({
+            "t_utc": live::iso(first_at),
+            "start_s": ((at + first.start) * 100.0).round() / 100.0,
+            "end_s": ((at + last.end) * 100.0).round() / 100.0,
+            "text": text,
+            "post": post,
+        });
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&self.transcript)?;
+        writeln!(f, "{row}")?;
+        let mut heard = lock(&self.heard);
+        heard.posts += 1;
+        heard.words += said.len();
+        heard.stt.add(stt);
+        for w in &said {
+            if let Some(arrived) = chunk.arrivals.at(sample(w.start)) {
+                heard.lag.add(posted - arrived);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Each still ffmpeg writes, posted to the thread as a file.
+fn post_stills(
+    h: Handle,
+    thread: i64,
+    asset: String,
+    title: String,
+    stills: mpsc::Receiver<(PathBuf, f64)>,
+    heard: Arc<Mutex<Heard>>,
+) {
+    for (file, at) in stills {
+        let name = format!("still-{}.jpg", live::clock(at).replace(':', ""));
+        let text = format!("[{} UTC] still", live::clock(at));
+        let body = json!({
+            "project": {"slug": "elevenlabs", "name": "ElevenLabs"},
+            "asset": {"path": format!("{asset}/{}", words::stem(&name)), "title": format!("{title} · {} UTC", live::clock(at)), "kind": "image"},
+            "caption": text,
+            "files": [{"role": "image", "file": file, "name": name, "mime": "image/jpeg"}],
+            "by": "elevenlabs",
+            "post": {"thread_id": thread, "text": text},
+        });
+        let publish = FilesPublishRequest { body: to_struct(&body).into(), ..Default::default() };
+        match h.request_timeout(&publish, Duration::from_secs(120)) {
+            Ok(_) => lock(&heard).stills += 1,
+            Err(e) => {
+                h.log(format!("live: couldn't post {}: {e:#}", file.display()));
+                lock(&heard).error(format!("a still didn't post: {e:#}"));
+            }
+        }
+    }
+}
+
+/// The stills in `dir` not yet seen, oldest first, with when each was written.
+fn new_stills(dir: &Path, seen: &mut std::collections::HashSet<PathBuf>) -> Vec<(PathBuf, f64)> {
+    let mut found: Vec<(PathBuf, f64)> = files_in(dir)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "jpg") && !seen.contains(p))
+        .map(|p| {
+            let at = std::fs::metadata(&p).and_then(|m| m.modified()).map(live::unix).unwrap_or(0.0);
+            (p, at)
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, _) in &found {
+        seen.insert(p.clone());
+    }
+    found
+}
+
+/// `elevenlabs.live`: hear a stream, and post what's said to a thread every so often, with a still now and then.
+fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
+    let url =
+        text_param(job, "url").context("url is missing: a YouTube live URL, or anything yt-dlp or ffmpeg reads")?;
+    let source = live::source(&url).map_err(|e| anyhow!(e))?;
+    let thread =
+        live::thread_id(&job.params["thread"]).context("thread is missing: the thread to post in (thr_123, or 123)")?;
+    let every = number(job, "every_seconds", 15.0, 5.0, 120.0)?;
+    let stills_every = number(job, "stills_every_seconds", 60.0, 0.0, 3600.0)?;
+    let stills_every = (stills_every > 0.0).then(|| stills_every.max(10.0));
+    let minutes = number(job, "minutes", 120.0, 0.1, 480.0)?;
+    let model = text_param(job, "model").unwrap_or_else(|| STT_MODEL.to_string());
+    let language = text_param(job, "language");
+    let ffmpeg = tool(&x.h, "ffmpeg", "ffmpeg")
+        .context("ffmpeg isn't on this machine: install it (brew install ffmpeg), or set the ffmpeg setting")?;
+    let r = x.ready(job)?;
+    let resolve = || -> anyhow::Result<Input> {
+        match &source {
+            live::Source::Page(u) => {
+                let ytdlp = tool(&x.h, "yt_dlp", "yt-dlp").context(
+                    "yt-dlp isn't on this machine, and it's needed for a page's stream: install it (brew install \
+                     yt-dlp), set the yt_dlp setting, or give the stream's own address (an .m3u8)",
+                )?;
+                job.progress(None, "finding the stream with yt-dlp");
+                page_input(&ytdlp, u, job)
+            }
+            live::Source::Stream(u) => {
+                Ok(Input { urls: vec![u.clone()], live: None, title: None, whitelist: live::PROTOCOLS })
+            }
+            live::Source::File(p) => {
+                let path = x.h.allowed(p)?;
+                if !path.is_file() {
+                    bail!("{} isn't a file", path.display());
+                }
+                Ok(Input {
+                    urls: vec![path.to_string_lossy().into_owned()],
+                    live: Some(false),
+                    title: None,
+                    whitelist: "file",
+                })
+            }
+        }
+    };
+    let first = resolve()?;
+    let title = first.title.clone().unwrap_or_else(|| url.clone());
+    let transcript = r.work.join("transcript.jsonl");
+    let heard = Arc::new(Mutex::new(Heard::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let ((stopped, seconds), credits) = x.paid(job, &r, true, || {
+        let (chunks, chunks_rx) = mpsc::channel::<Said>();
+        let ear = Ear {
+            h: x.h.clone(),
+            cli: r.cli.clone(),
+            key: Key { name: r.key.name.clone(), value: r.key.value.clone() },
+            base: r.base.clone(),
+            work: r.work.clone(),
+            thread,
+            model: model.clone(),
+            language: language.clone(),
+            transcript: transcript.clone(),
+            heard: heard.clone(),
+            stop: stop.clone(),
+        };
+        let ear = std::thread::spawn(move || ear.transcribe(chunks_rx));
+        let (stills, stills_rx) = mpsc::channel::<(PathBuf, f64)>();
+        let poster = {
+            let (h, heard) = (x.h.clone(), heard.clone());
+            let asset = format!("live/{}", words::slug(&job.id, 40));
+            let title = title.clone();
+            std::thread::spawn(move || post_stills(h, thread, asset, title, stills_rx, heard))
+        };
+        let dir = r.work.join("stills");
+        std::fs::create_dir_all(&dir)?;
+        let mut seen = std::collections::HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs_f64(minutes * 60.0);
+        let chunk_len = (every * live::RATE as f64) as usize;
+        let mut pcm: Vec<i16> = Vec::new();
+        let mut odd: Option<u8> = None;
+        let mut total: u64 = 0;
+        let mut pcm_start: u64 = 0;
+        let mut arrivals = live::Arrivals::default();
+        let was_live = first.live == Some(true);
+        let mut input = Some(first);
+        let mut with_stills = stills_every;
+        let mut last_progress = Instant::now();
+        // since when the stream has been gone, and whether it ever came
+        let mut dropped: Option<f64> = None;
+        let stop_why = |job: &Job| -> Option<String> {
+            if job.cancelled() {
+                return Some("it was cancelled".into());
+            }
+            if Instant::now() >= deadline {
+                return Some(format!("its {minutes} minutes were up"));
+            }
+            lock(&heard).refused.clone()
+        };
+        let stopped: String = loop {
+            if let Some(why) = stop_why(job) {
+                break why;
+            }
+            let inp = match input.take() {
+                Some(i) => i,
+                None => match resolve() {
+                    // a live page that isn't live now (between a Zoom stream's drop and its restart, or after it):
+                    // not back yet, rather than its recording read from the start
+                    Ok(i) if was_live && i.live != Some(true) => {
+                        wait_for(job, deadline, RECONNECT);
+                        continue;
+                    }
+                    Ok(i) => i,
+                    Err(e) => {
+                        x.h.log(format!("live: the stream isn't there yet: {e:#}"));
+                        wait_for(job, deadline, RECONNECT);
+                        continue;
+                    }
+                },
+            };
+            let mut child = Command::new(&ffmpeg)
+                .args(ffmpeg_args(&inp, with_stills.map(|s| (dir.as_path(), s))))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .with_context(|| format!("starting {}", ffmpeg.display()))?;
+            let mut out = child.stdout.take().context("ffmpeg gave no stdout")?;
+            let mut err = child.stderr.take().context("ffmpeg gave no stderr")?;
+            let tail = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            });
+            let (bytes, bytes_rx) = mpsc::channel::<(Vec<u8>, SystemTime)>();
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 6400];
+                loop {
+                    match out.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if bytes.send((buf[..n].to_vec(), SystemTime::now())).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let heard_before = total;
+            let mut last_sound = Instant::now();
+            let why: Option<String> = loop {
+                if let Some(why) = stop_why(job) {
+                    break Some(why);
+                }
+                match bytes_rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok((b, at)) => {
+                        last_sound = Instant::now();
+                        if let Some(since) = dropped.take() {
+                            let now = live::unix(SystemTime::now());
+                            let gone = words::took(Duration::from_secs_f64((now - since).max(0.0)));
+                            let _ = chunks.send(Said::Line(format!(
+                                "[{} UTC] The stream is back (it was gone {gone}).",
+                                live::clock(now)
+                            )));
+                        }
+                        let mut b = b;
+                        if let Some(o) = odd.take() {
+                            b.insert(0, o);
+                        }
+                        if b.len() % 2 == 1 {
+                            odd = b.pop();
+                        }
+                        pcm.extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+                        total += (b.len() / 2) as u64;
+                        arrivals.mark(total, live::unix(at));
+                        if pcm.len() >= chunk_len {
+                            let cut = live::quiet_cut(&pcm);
+                            let samples: Vec<i16> = pcm.drain(..cut).collect();
+                            let _ = chunks.send(Said::Chunk(Chunk {
+                                start: pcm_start,
+                                samples,
+                                arrivals: arrivals.clone(),
+                            }));
+                            pcm_start += cut as u64;
+                            arrivals.forget_before(pcm_start);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if last_sound.elapsed() > STALL => break None,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                }
+                for s in new_stills(&dir, &mut seen) {
+                    let _ = stills.send(s);
+                }
+                if last_progress.elapsed() >= Duration::from_secs(5) {
+                    last_progress = Instant::now();
+                    let h = lock(&heard);
+                    let lag = h.lag.median().map(|l| format!(", lag {l:.1} s")).unwrap_or_default();
+                    let heard_s = total / live::RATE as u64;
+                    job.progress_detail(
+                        None,
+                        format!(
+                            "listening: {} heard, {} posts, {} stills{lag}",
+                            words::took(Duration::from_secs(heard_s)),
+                            h.posts,
+                            h.stills
+                        )
+                        .as_str(),
+                        json!({"posts": h.posts, "stills": h.stills, "heard_seconds": heard_s}),
+                    );
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            let said = tail.join().unwrap_or_default();
+            odd = None;
+            if let Some(why) = why {
+                break why;
+            }
+            // ffmpeg stopped by itself, or went quiet: a picture-less stream, the end of a file, or a drop
+            if total == heard_before && with_stills.is_some() && said.contains("does not contain any stream") {
+                with_stills = None;
+                lock(&heard).error("the stream has no picture, so there are no stills".into());
+                input = Some(inp);
+                continue;
+            }
+            if inp.live == Some(false) {
+                break "the stream ended".into();
+            }
+            // what was heard before the drop is posted first, then the drop
+            if !pcm.is_empty() {
+                let samples = std::mem::take(&mut pcm);
+                let n = samples.len() as u64;
+                if n >= live::RATE as u64 {
+                    let _ = chunks.send(Said::Chunk(Chunk { start: pcm_start, samples, arrivals: arrivals.clone() }));
+                }
+                pcm_start += n;
+                arrivals.forget_before(pcm_start);
+            }
+            let said = cli::clip(said.trim(), 300);
+            x.h.log(format!("live: the stream dropped (ffmpeg: {said}); trying again every 10 s"));
+            if dropped.is_none() {
+                let now = live::unix(SystemTime::now());
+                dropped = Some(now);
+                lock(&heard).drops += 1;
+                let _ = chunks.send(Said::Line(format!(
+                    "[{} UTC] The stream dropped: trying again every 10 s.",
+                    live::clock(now)
+                )));
+            }
+            wait_for(job, deadline, RECONNECT);
+        };
+        // the rest of the sound, and the last stills
+        if pcm.len() >= live::RATE && !job.cancelled() {
+            let _ = chunks.send(Said::Chunk(Chunk {
+                start: pcm_start,
+                samples: std::mem::take(&mut pcm),
+                arrivals: arrivals.clone(),
+            }));
+        }
+        if job.cancelled() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        for s in new_stills(&dir, &mut seen) {
+            let _ = stills.send(s);
+        }
+        drop(chunks);
+        drop(stills);
+        let _ = ear.join();
+        let _ = poster.join();
+        Ok((stopped, total / live::RATE as u64))
+    })?;
+
+    let h = lock(&heard);
+    let lag = match (h.lag.median(), h.lag.worst()) {
+        (Some(m), Some(w)) => {
+            format!("lag median {m:.1} s, worst {w:.1} s (a word reaching {} to its post)", machine(&x.h))
+        }
+        _ => "no words, so no lag".into(),
+    };
+    let summary = format!(
+        "Stopped listening to {title}: {stopped}. Heard {}: {} posts, {} words, {} stills{}; {lag}. {}",
+        words::took(Duration::from_secs(seconds)),
+        h.posts,
+        h.words,
+        h.stills,
+        if h.drops > 0 { format!(", {} drops", h.drops) } else { String::new() },
+        credits.line()
+    );
+    if let Err(e) = board_post(&x.h, thread, &summary) {
+        x.h.log(format!("live: couldn't post the summary: {e:#}"));
+    }
+    if transcript.is_file() {
+        job.output(&transcript, "document", Role::Main, json!({"file": "transcript", "credits": credits.used}));
+    }
+    job.check()?;
+    Ok(json!({
+        "text": summary,
+        "stopped": stopped,
+        "heard_seconds": seconds,
+        "posts": h.posts,
+        "words": h.words,
+        "quiet_chunks": h.quiet,
+        "stills": h.stills,
+        "drops": h.drops,
+        "lag": h.lag.json(),
+        "stt": h.stt.json(),
+        "errors": h.errors,
+        "transcript": transcript,
+        "credits": credits.json(),
+    }))
+}
+
 /// Health's two parts: the CLI (its version and where it came from) and the key (with the account's credits).
 fn health(x: &Ext) -> Vec<Part> {
     let h = &x.h;
@@ -887,7 +1552,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     type Cmd = fn(&Ext, &Job) -> anyhow::Result<Value>;
-    let commands: [(&str, Cmd); 7] = [
+    let commands: [(&str, Cmd); 8] = [
         ("elevenlabs.isolate", isolate),
         ("elevenlabs.tts", tts),
         ("elevenlabs.stt", stt),
@@ -895,6 +1560,7 @@ fn main() -> anyhow::Result<()> {
         ("elevenlabs.voices", voices),
         ("elevenlabs.usage", usage),
         ("elevenlabs.run", run),
+        ("elevenlabs.live", live),
     ];
     for (kind, f) in commands {
         let xc = x.clone();
