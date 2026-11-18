@@ -41,7 +41,9 @@ const DEVICE_MAX: usize = 80;
 pub fn device(name: &str) -> Result<String, String> {
     let n = name.trim();
     if n.is_empty() {
-        return Err("give the device's name or index (ffmpeg -f avfoundation -list_devices true -i \"\" lists them)".into());
+        return Err(
+            "give the device's name or index (ffmpeg -f avfoundation -list_devices true -i \"\" lists them)".into()
+        );
     }
     if n.starts_with('-') || n.contains(':') || n.len() > DEVICE_MAX || n.chars().any(char::is_control) {
         return Err(format!("{n} isn't a device's name or index"));

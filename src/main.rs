@@ -1766,8 +1766,13 @@ mod tests {
 
     #[test]
     fn stills_are_taken_as_their_frames_come() {
-        let input =
-            Input { urls: vec!["https://x/index.m3u8".into()], live: Some(true), title: None, whitelist: "https", format: None };
+        let input = Input {
+            urls: vec!["https://x/index.m3u8".into()],
+            live: Some(true),
+            title: None,
+            whitelist: "https",
+            format: None,
+        };
         let a = ffmpeg_args(&input, Some((Path::new("/w/stills"), 60.0)));
         let vf = a.iter().position(|x| x == "-vf").map(|i| a[i + 1].clone()).unwrap();
         assert!(vf.starts_with("select='isnan(prev_selected_t)+gte(t-prev_selected_t,60)'"), "{vf}");
