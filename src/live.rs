@@ -206,7 +206,7 @@ impl Lags {
         }
         v.sort_by(|a, b| a.total_cmp(b));
         let m = v.len() / 2;
-        Some(if v.len() % 2 == 0 { (v[m - 1] + v[m]) / 2.0 } else { v[m] })
+        Some(if v.len().is_multiple_of(2) { (v[m - 1] + v[m]) / 2.0 } else { v[m] })
     }
 
     pub fn worst(&self) -> Option<f64> {
