@@ -52,6 +52,7 @@ fn listening_node_with(roots: &[&Path], posted: &Posted, settings: Value) -> Sta
         .binary(env!("CARGO_BIN_EXE_elevenlabs"))
         .settings(settings)
         .env("POINTMAN_ELEVENLABS_RETRY_MS", "500")
+        .env("POINTMAN_ELEVENLABS_QUIET_SECS", "8")
         .secrets([("elevenlabs.main".to_string(), KEY.to_string())])
         .roots(roots.iter().map(|r| r.to_path_buf()))
         .method("board.post", move |params: Value| {
@@ -172,6 +173,33 @@ fn a_stream_that_hasnt_started_is_waited_for() {
     assert!(lines.iter().any(|l| l.ends_with("UTC] hello world")), "{lines:#?}");
     assert!(lines.last().unwrap().starts_with("Stopped listening to The webinar: the stream ended."), "{lines:#?}");
     assert!(done.result["posts"].as_u64().unwrap() >= 1);
+}
+
+/// A stretch with no words (music, a pause) is said in the thread every so often, so it isn't taken for a fault;
+/// the summary counts the chunks. (The tests say it every 8 s; a stream every 2 min.)
+#[test]
+fn a_quiet_stretch_is_said() {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("no ffmpeg here: skipped");
+        return;
+    };
+    let fake = Fake::new();
+    fake.hears_nothing();
+    let folder = tempfile::tempdir().unwrap();
+    let file = clip(&ffmpeg, folder.path(), 12);
+    let posted: Posted = Arc::default();
+    let node = listening_node(&fake, &[folder.path()], &posted);
+    let params = json!({"url": file, "thread": "thr_7", "every_seconds": 5, "stills_every_seconds": 0});
+    let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs(90)).unwrap();
+    let lines: Vec<String> =
+        posted.lock().unwrap().iter().map(|(_, p)| p["text"].as_str().unwrap_or_default().to_string()).collect();
+    let quiet: Vec<&String> = lines.iter().filter(|l| l.ends_with("UTC] 1 min, no words.")).collect();
+    assert_eq!(quiet.len(), 1, "one line for the first 8 s and more of quiet: {lines:#?}");
+    assert_eq!(done.result["posts"], 0);
+    let chunks = done.result["quiet_chunks"].as_u64().unwrap();
+    assert!(chunks >= 2, "{}", done.result);
+    assert!(lines.last().unwrap().contains(&format!(", {chunks} chunks with no words;")), "{lines:#?}");
+    assert!(node.log().contains("live: chunk 1: 0 words"), "each chunk is logged: {}", node.log());
 }
 
 #[test]

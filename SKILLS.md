@@ -27,7 +27,7 @@ you never run `elevenlabs auth` or write a `.env`.
   Each paid command says what it used and what's left.
 - **`live` runs until `minutes`** or until it's cancelled, and spends credits all the while (batch speech to
   text on each chunk): give `minutes` for a test, and cancel it when the stream is over. Posts lag the speaker
-  by about `every_seconds` plus a few seconds. A dropped stream is tried again every 10 s, with a line saying so.
+  by about `every_seconds` plus a few seconds. A dropped stream is tried again every 10 s, with a line saying so; 2 min with no words gets a `2 min, no words.` line, and a chunk it couldn't transcribe gets a `Couldn't hear` line, so quiet and faults look different.
 - **`voice`** is a name from `elevenlabs.voices` (or the start of one) or a voice id.
 - **`run` is a dry run unless `dry_run: false`.** Do the dry run first and read the request it shows.
   Anything that deletes, removes, disables or clones also needs `confirm: true`. Ask your person first.
