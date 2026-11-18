@@ -28,6 +28,25 @@ pub enum Source {
     Stream(String),
     /// A file on this machine.
     File(String),
+    /// A microphone on this machine (`mic:<name or index>`), heard directly: no stream's delay. macOS only, through
+    /// ffmpeg's avfoundation.
+    Mic(String),
+}
+
+/// The longest device name `mic:` takes.
+const DEVICE_MAX: usize = 80;
+
+/// A device's name or index as `mic:` or `camera` gives it, or why it can't be one: never a flag, and no `:` (it
+/// separates avfoundation's picture from its sound).
+pub fn device(name: &str) -> Result<String, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("give the device's name or index (ffmpeg -f avfoundation -list_devices true -i \"\" lists them)".into());
+    }
+    if n.starts_with('-') || n.contains(':') || n.len() > DEVICE_MAX || n.chars().any(char::is_control) {
+        return Err(format!("{n} isn't a device's name or index"));
+    }
+    Ok(n.to_string())
 }
 
 /// What `url` is, or why it can't be one.
@@ -38,6 +57,9 @@ pub fn source(url: &str) -> Result<Source, String> {
     }
     if u.starts_with('-') {
         return Err(format!("{u} isn't a URL"));
+    }
+    if let Some(name) = u.strip_prefix("mic:") {
+        return Ok(Source::Mic(device(name)?));
     }
     let Some((scheme, rest)) = u.split_once("://") else {
         if u.contains(':') && !u.starts_with('/') && !u.starts_with('~') {
@@ -241,6 +263,11 @@ mod tests {
         assert!(source("concat:/a|/b").is_err());
         assert!(source("subfile,,start,0,end,0,,:/etc/passwd").is_err());
         assert!(source("-i").is_err());
+        assert_eq!(source("mic:MacBook Pro Microphone").unwrap(), Source::Mic("MacBook Pro Microphone".into()));
+        assert_eq!(source("mic:1").unwrap(), Source::Mic("1".into()));
+        assert!(source("mic:").is_err());
+        assert!(source("mic:-i").is_err());
+        assert!(source("mic:0:1").is_err(), "a : would name a picture too");
         assert!(source(" ").is_err());
     }
 

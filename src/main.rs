@@ -842,6 +842,8 @@ struct Input {
     live: Option<bool>,
     title: Option<String>,
     whitelist: &'static str,
+    /// ffmpeg's input format, for a device (`avfoundation`); None: what the address is.
+    format: Option<&'static str>,
 }
 
 /// A page's stream, as yt-dlp finds it: a picture small enough for stills with its sound, else the sound alone.
@@ -862,7 +864,7 @@ fn page_input(ytdlp: &Path, url: &str, job: &Job) -> anyhow::Result<Input> {
     if urls.is_empty() {
         bail!("yt-dlp found no stream's address at {url}");
     }
-    Ok(Input { urls, live, title, whitelist: live::PROTOCOLS })
+    Ok(Input { urls, live, title, whitelist: live::PROTOCOLS, format: None })
 }
 
 /// ffmpeg's arguments: the sound as 16 kHz mono PCM on stdout, and when `stills` says, a still every so many
@@ -876,6 +878,13 @@ fn ffmpeg_args(input: &Input, stills: Option<(&Path, f64)>) -> Vec<String> {
         }
         if url.contains(".m3u8") && input.live != Some(false) {
             a.extend(["-live_start_index".into(), "-1".into()]);
+        }
+        if let Some(format) = input.format {
+            // a camera wants its frame rate named; the sound alone doesn't
+            if !url.starts_with(':') {
+                a.extend(["-framerate".into(), "30".into()]);
+            }
+            a.extend(["-f".into(), format.into()]);
         }
         a.extend(["-i".into(), url.clone()]);
     }
@@ -1194,6 +1203,11 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     let minutes = number(job, "minutes", 120.0, 0.1, 480.0)?;
     let model = text_param(job, "model").unwrap_or_else(|| STT_MODEL.to_string());
     let language = text_param(job, "language");
+    // the camera a mic: source takes its stills from: a name or index, as `mic:`'s
+    let camera = match text_param(job, "camera") {
+        Some(c) => Some(live::device(&c).map_err(|e| anyhow!(e))?),
+        None => None,
+    };
     let ffmpeg = tool(&x.h, "ffmpeg", "ffmpeg")
         .context("ffmpeg isn't on this machine: install it (brew install ffmpeg), or set the ffmpeg setting")?;
     let ytdlp = match &source {
@@ -1211,7 +1225,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                 page_input(ytdlp.as_deref().context("no yt-dlp")?, u, job)
             }
             live::Source::Stream(u) => {
-                Ok(Input { urls: vec![u.clone()], live: None, title: None, whitelist: live::PROTOCOLS })
+                Ok(Input { urls: vec![u.clone()], live: None, title: None, whitelist: live::PROTOCOLS, format: None })
             }
             live::Source::File(p) => {
                 let path = x.h.allowed(p)?;
@@ -1223,6 +1237,21 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                     live: Some(false),
                     title: None,
                     whitelist: "file",
+                    format: None,
+                })
+            }
+            // a microphone, and the camera for stills if one's named: avfoundation's "<picture>:<sound>"
+            live::Source::Mic(name) => {
+                if !cfg!(target_os = "macos") {
+                    bail!("mic: works on macOS only (ffmpeg's avfoundation)");
+                }
+                let picture = camera.clone().unwrap_or_default();
+                Ok(Input {
+                    urls: vec![format!("{picture}:{name}")],
+                    live: Some(true),
+                    title: Some(format!("the microphone {name}")),
+                    whitelist: "file",
+                    format: Some("avfoundation"),
                 })
             }
         }
@@ -1718,9 +1747,27 @@ mod tests {
     }
 
     #[test]
+    fn a_mic_is_read_with_avfoundation_and_a_camera_only_when_named() {
+        let mic = |url: &str| Input {
+            urls: vec![url.into()],
+            live: Some(true),
+            title: None,
+            whitelist: "file",
+            format: Some("avfoundation"),
+        };
+        let a = ffmpeg_args(&mic(":MacBook Pro Microphone"), None);
+        let i = a.iter().position(|x| x == "-i").unwrap();
+        assert_eq!(a[i - 2..=i + 1], ["-f", "avfoundation", "-i", ":MacBook Pro Microphone"], "{a:?}");
+        assert!(!a.iter().any(|x| x == "-framerate" || x == "-re"), "sound alone, read as it comes: {a:?}");
+        let a = ffmpeg_args(&mic("Sony Camera (Imaging Edge):1"), Some((Path::new("/w/stills"), 30.0)));
+        assert!(a.windows(2).any(|w| w == ["-framerate", "30"]), "a camera's rate is named: {a:?}");
+        assert!(a.iter().any(|x| x == "0:v:0?"), "stills from the camera: {a:?}");
+    }
+
+    #[test]
     fn stills_are_taken_as_their_frames_come() {
         let input =
-            Input { urls: vec!["https://x/index.m3u8".into()], live: Some(true), title: None, whitelist: "https" };
+            Input { urls: vec!["https://x/index.m3u8".into()], live: Some(true), title: None, whitelist: "https", format: None };
         let a = ffmpeg_args(&input, Some((Path::new("/w/stills"), 60.0)));
         let vf = a.iter().position(|x| x == "-vf").map(|i| a[i + 1].clone()).unwrap();
         assert!(vf.starts_with("select='isnan(prev_selected_t)+gte(t-prev_selected_t,60)'"), "{vf}");
