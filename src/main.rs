@@ -911,6 +911,15 @@ enum Said {
 const STALL: Duration = Duration::from_secs(30);
 const RECONNECT: Duration = Duration::from_secs(10);
 
+/// [`RECONNECT`], or POINTMAN_ELEVENLABS_RETRY_MS for a test that can't wait 10 s a try.
+fn reconnect() -> Duration {
+    std::env::var("POINTMAN_ELEVENLABS_RETRY_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(RECONNECT)
+}
+
 /// Wait `d`, or less when the job is cancelled or its time is up: true when it waited the whole time.
 fn wait_for(job: &Job, deadline: Instant, d: Duration) -> bool {
     let until = Instant::now() + d;
@@ -1076,12 +1085,13 @@ fn post_stills(
     h: Handle,
     thread: i64,
     asset: String,
-    title: String,
+    title: &Mutex<String>,
     stills: mpsc::Receiver<(PathBuf, f64)>,
     heard: Arc<Mutex<Heard>>,
 ) {
     for (file, at) in stills {
         let name = format!("still-{}.jpg", live::clock(at).replace(':', ""));
+        let title = lock(title).clone();
         let text = format!("[{} UTC] still", live::clock(at));
         let body = json!({
             "project": {"slug": "elevenlabs", "name": "ElevenLabs"},
@@ -1134,16 +1144,19 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     let language = text_param(job, "language");
     let ffmpeg = tool(&x.h, "ffmpeg", "ffmpeg")
         .context("ffmpeg isn't on this machine: install it (brew install ffmpeg), or set the ffmpeg setting")?;
+    let ytdlp = match &source {
+        live::Source::Page(_) => Some(tool(&x.h, "yt_dlp", "yt-dlp").context(
+            "yt-dlp isn't on this machine, and it's needed for a page's stream: install it (brew install yt-dlp), \
+             set the yt_dlp setting, or give the stream's own address (an .m3u8)",
+        )?),
+        _ => None,
+    };
     let r = x.ready(job)?;
     let resolve = || -> anyhow::Result<Input> {
         match &source {
             live::Source::Page(u) => {
-                let ytdlp = tool(&x.h, "yt_dlp", "yt-dlp").context(
-                    "yt-dlp isn't on this machine, and it's needed for a page's stream: install it (brew install \
-                     yt-dlp), set the yt_dlp setting, or give the stream's own address (an .m3u8)",
-                )?;
                 job.progress(None, "finding the stream with yt-dlp");
-                page_input(&ytdlp, u, job)
+                page_input(ytdlp.as_deref().context("no yt-dlp")?, u, job)
             }
             live::Source::Stream(u) => {
                 Ok(Input { urls: vec![u.clone()], live: None, title: None, whitelist: live::PROTOCOLS })
@@ -1162,8 +1175,13 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
             }
         }
     };
-    let first = resolve()?;
-    let title = first.title.clone().unwrap_or_else(|| url.clone());
+    // a page's stream may not have started yet (a scheduled live): it's waited for, in the loop below; a file
+    // that isn't there fails at once
+    let first = match &source {
+        live::Source::Page(_) => None,
+        _ => Some(resolve()?),
+    };
+    let title = Arc::new(Mutex::new(url.clone()));
     let transcript = r.work.join("transcript.jsonl");
     let heard = Arc::new(Mutex::new(Heard::default()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1189,7 +1207,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
             let (h, heard) = (x.h.clone(), heard.clone());
             let asset = format!("live/{}", words::slug(&job.id, 40));
             let title = title.clone();
-            std::thread::spawn(move || post_stills(h, thread, asset, title, stills_rx, heard))
+            std::thread::spawn(move || post_stills(h, thread, asset, &title, stills_rx, heard))
         };
         let dir = r.work.join("stills");
         std::fs::create_dir_all(&dir)?;
@@ -1201,8 +1219,10 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         let mut total: u64 = 0;
         let mut pcm_start: u64 = 0;
         let mut arrivals = live::Arrivals::default();
-        let was_live = first.live == Some(true);
-        let mut input = Some(first);
+        let mut was_live = first.as_ref().is_some_and(|f| f.live == Some(true));
+        let mut input = first;
+        // posted once when the stream hasn't started yet, and cleared by its first sound
+        let mut waiting = false;
         let mut with_stills = stills_every;
         let mut last_progress = Instant::now();
         // since when the stream has been gone, and whether it ever came
@@ -1226,13 +1246,27 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                     // a live page that isn't live now (between a Zoom stream's drop and its restart, or after it):
                     // not back yet, rather than its recording read from the start
                     Ok(i) if was_live && i.live != Some(true) => {
-                        wait_for(job, deadline, RECONNECT);
+                        wait_for(job, deadline, reconnect());
                         continue;
                     }
-                    Ok(i) => i,
+                    Ok(i) => {
+                        was_live |= i.live == Some(true);
+                        if let Some(t) = &i.title {
+                            *lock(&title) = t.clone();
+                        }
+                        i
+                    }
                     Err(e) => {
                         x.h.log(format!("live: the stream isn't there yet: {e:#}"));
-                        wait_for(job, deadline, RECONNECT);
+                        if total == 0 && !waiting {
+                            waiting = true;
+                            let now = live::unix(SystemTime::now());
+                            let _ = chunks.send(Said::Line(format!(
+                                "[{} UTC] Waiting for the stream to start.",
+                                live::clock(now)
+                            )));
+                        }
+                        wait_for(job, deadline, reconnect());
                         continue;
                     }
                 },
@@ -1274,6 +1308,11 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                 match bytes_rx.recv_timeout(Duration::from_millis(250)) {
                     Ok((b, at)) => {
                         last_sound = Instant::now();
+                        if std::mem::take(&mut waiting) {
+                            let now = live::unix(SystemTime::now());
+                            let _ =
+                                chunks.send(Said::Line(format!("[{} UTC] The stream has started.", live::clock(now))));
+                        }
                         if let Some(since) = dropped.take() {
                             let now = live::unix(SystemTime::now());
                             let gone = words::took(Duration::from_secs_f64((now - since).max(0.0)));
@@ -1289,7 +1328,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                         if b.len() % 2 == 1 {
                             odd = b.pop();
                         }
-                        pcm.extend(b.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])));
+                        pcm.extend(b.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)));
                         total += (b.len() / 2) as u64;
                         arrivals.mark(total, live::unix(at));
                         if pcm.len() >= chunk_len {
@@ -1346,6 +1385,17 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
             if inp.live == Some(false) {
                 break "the stream ended".into();
             }
+            // never heard yet (an address that isn't up): still waiting for it to start, not a drop
+            if total == 0 {
+                if !waiting {
+                    waiting = true;
+                    let now = live::unix(SystemTime::now());
+                    let _ =
+                        chunks.send(Said::Line(format!("[{} UTC] Waiting for the stream to start.", live::clock(now))));
+                }
+                wait_for(job, deadline, reconnect());
+                continue;
+            }
             // what was heard before the drop is posted first, then the drop
             if !pcm.is_empty() {
                 let samples = std::mem::take(&mut pcm);
@@ -1367,7 +1417,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
                     live::clock(now)
                 )));
             }
-            wait_for(job, deadline, RECONNECT);
+            wait_for(job, deadline, reconnect());
         };
         // the rest of the sound, and the last stills
         if pcm.len() >= live::RATE && !job.cancelled() {
@@ -1397,6 +1447,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         }
         _ => "no words, so no lag".into(),
     };
+    let title = lock(&title).clone();
     let summary = format!(
         "Stopped listening to {title}: {stopped}. Heard {}: {} posts, {} words, {} stills{}; {lag}. {}",
         words::took(Duration::from_secs(seconds)),
