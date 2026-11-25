@@ -23,7 +23,7 @@ use pointman_extension::protocol::{
 };
 use pointman_extension::v1::health::part::State;
 use pointman_extension::v1::health::{Action, Part};
-use pointman_extension::v1::ThreadRef;
+use pointman_extension::v1::ChannelRef;
 use pointman_extension::{Extension, Handle, Job};
 use serde_json::{json, Value};
 
@@ -91,7 +91,7 @@ fn find(h: &Handle) -> Option<Found> {
     )
 }
 
-const ADD: &str = "add one with `/elevenlabs add` in any thread: the app's form seals it in the vault, so it never \
+const ADD: &str = "add one with `/elevenlabs add` in any channel: the app's form seals it in the vault, so it never \
                    goes in a post";
 
 /// The key a call uses: the `account` setting's vault item, else the first `elevenlabs.` one by label.
@@ -925,7 +925,7 @@ enum Said {
 /// dropped stream is tried again.
 const STALL: Duration = Duration::from_secs(30);
 const RECONNECT: Duration = Duration::from_secs(10);
-/// How much of the stream with no words is said in the thread as one line: "2 min, no words."
+/// How much of the stream with no words is said in the channel as one line: "2 min, no words."
 const QUIET_LINE: Duration = Duration::from_secs(120);
 
 /// [`QUIET_LINE`], or POINTMAN_ELEVENLABS_QUIET_SECS for a test.
@@ -966,7 +966,7 @@ struct Heard {
     quiet: usize,
     /// Seconds of the stream heard since the last words, or since the last line saying there were none.
     quiet_run: f64,
-    /// When a chunk that couldn't be heard was last said in the thread.
+    /// When a chunk that couldn't be heard was last said in the channel.
     failed_said: Option<Instant>,
     stills: usize,
     drops: usize,
@@ -985,10 +985,10 @@ impl Heard {
     }
 }
 
-/// A post of the extension's own in `thread`, tried twice.
-fn board_post(h: &Handle, thread: i64, text: &str) -> anyhow::Result<String> {
+/// A post of the extension's own in `channel`, tried twice.
+fn board_post(h: &Handle, channel: i64, text: &str) -> anyhow::Result<String> {
     let ask = BoardPostRequest {
-        thread: ThreadRef { id: format!("thr_{thread}"), ..Default::default() }.into(),
+        channel: ChannelRef { id: format!("ch_{channel}"), ..Default::default() }.into(),
         text: text.to_string(),
         ..Default::default()
     };
@@ -1007,7 +1007,7 @@ struct Ear {
     key: Key,
     base: String,
     work: PathBuf,
-    thread: i64,
+    channel: i64,
     model: String,
     language: Option<String>,
     transcript: PathBuf,
@@ -1016,7 +1016,7 @@ struct Ear {
 }
 
 impl Ear {
-    /// Each chunk to ElevenLabs' speech to text, and its words posted as one line in the thread.
+    /// Each chunk to ElevenLabs' speech to text, and its words posted as one line in the channel.
     fn transcribe(&self, said: mpsc::Receiver<Said>) {
         let mut n = 0;
         for said in said {
@@ -1026,7 +1026,7 @@ impl Ear {
             let chunk = match said {
                 Said::Chunk(c) => c,
                 Said::Line(line) => {
-                    if let Err(e) = board_post(&self.h, self.thread, &line) {
+                    if let Err(e) = board_post(&self.h, self.channel, &line) {
                         lock(&self.heard).error(format!("couldn't post {line:?}: {e:#}"));
                     }
                     continue;
@@ -1042,7 +1042,7 @@ impl Ear {
                         heard.refused = Some(e.clone());
                     }
                     heard.error(e.clone());
-                    // a fault is said in the thread, at most once every QUIET_LINE, so it's never taken for quiet
+                    // a fault is said in the channel, at most once every QUIET_LINE, so it's never taken for quiet
                     let due = heard.failed_said.is_none_or(|at| at.elapsed() >= quiet_line());
                     if due {
                         heard.failed_said = Some(Instant::now());
@@ -1056,7 +1056,7 @@ impl Ear {
                         live::clock(live::unix(SystemTime::now())),
                         cli::clip(&e, 200)
                     );
-                    let _ = board_post(&self.h, self.thread, &line);
+                    let _ = board_post(&self.h, self.channel, &line);
                 }
             }
         }
@@ -1097,7 +1097,7 @@ impl Ear {
         let sample = |s: f64| chunk.start + (s.max(0.0) * live::RATE as f64) as u64;
         self.h.log(format!("live: chunk {n}: {} words, {stt:.1} s to transcribe", said.len()));
         let (Some(first), Some(last)) = (said.first(), said.last()) else {
-            // no words: a pause, music, or a silent stream. Every QUIET_LINE of them is said in the thread, so a quiet
+            // no words: a pause, music, or a silent stream. Every QUIET_LINE of them is said in the channel, so a quiet
             // stretch can be told from a fault
             let line = {
                 let mut heard = lock(&self.heard);
@@ -1110,12 +1110,12 @@ impl Ear {
                 let end = chunk.start + chunk.samples.len() as u64;
                 let at = chunk.arrivals.at(end).unwrap_or_else(|| live::unix(SystemTime::now()));
                 let minutes = (quiet / 60.0).floor().max(1.0);
-                board_post(&self.h, self.thread, &format!("[{} UTC] {minutes} min, no words.", live::clock(at)))?;
+                board_post(&self.h, self.channel, &format!("[{} UTC] {minutes} min, no words.", live::clock(at)))?;
             }
             return Ok(());
         };
         let first_at = chunk.arrivals.at(sample(first.start)).unwrap_or_else(|| live::unix(SystemTime::now()));
-        let post = board_post(&self.h, self.thread, &live::line(first_at, &text))?;
+        let post = board_post(&self.h, self.channel, &live::line(first_at, &text))?;
         let posted = live::unix(SystemTime::now());
         let at = chunk.start as f64 / live::RATE as f64;
         let row = json!({
@@ -1141,10 +1141,10 @@ impl Ear {
     }
 }
 
-/// Each still ffmpeg writes, posted to the thread as a file.
+/// Each still ffmpeg writes, posted to the channel as a file.
 fn post_stills(
     h: Handle,
-    thread: i64,
+    channel: i64,
     asset: String,
     title: &Mutex<String>,
     stills: mpsc::Receiver<(PathBuf, f64)>,
@@ -1160,7 +1160,7 @@ fn post_stills(
             "caption": text,
             "files": [{"role": "image", "file": file, "name": name, "mime": "image/jpeg"}],
             "by": "elevenlabs",
-            "post": {"thread_id": thread, "text": text},
+            "post": {"channel_id": channel, "text": text},
         });
         let publish = FilesPublishRequest { body: to_struct(&body).into(), ..Default::default() };
         match h.request_timeout(&publish, Duration::from_secs(120)) {
@@ -1190,13 +1190,13 @@ fn new_stills(dir: &Path, seen: &mut std::collections::HashSet<PathBuf>) -> Vec<
     found
 }
 
-/// `elevenlabs.live`: hear a stream, and post what's said to a thread every so often, with a still now and then.
+/// `elevenlabs.live`: hear a stream, and post what's said to a channel every so often, with a still now and then.
 fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
     let url =
         text_param(job, "url").context("url is missing: a YouTube live URL, or anything yt-dlp or ffmpeg reads")?;
     let source = live::source(&url).map_err(|e| anyhow!(e))?;
-    let thread =
-        live::thread_id(&job.params["thread"]).context("thread is missing: the thread to post in (thr_123, or 123)")?;
+    let channel = live::channel_id(&job.params["channel"])
+        .context("channel is missing: the channel to post in (ch_123, or 123)")?;
     let every = number(job, "every_seconds", 15.0, 5.0, 120.0)?;
     let stills_every = number(job, "stills_every_seconds", 60.0, 0.0, 3600.0)?;
     let stills_every = (stills_every > 0.0).then(|| stills_every.max(10.0));
@@ -1275,7 +1275,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
             key: Key { name: r.key.name.clone(), value: r.key.value.clone() },
             base: r.base.clone(),
             work: r.work.clone(),
-            thread,
+            channel,
             model: model.clone(),
             language: language.clone(),
             transcript: transcript.clone(),
@@ -1288,7 +1288,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
             let (h, heard) = (x.h.clone(), heard.clone());
             let asset = format!("live/{}", words::slug(&job.id, 40));
             let title = title.clone();
-            std::thread::spawn(move || post_stills(h, thread, asset, &title, stills_rx, heard))
+            std::thread::spawn(move || post_stills(h, channel, asset, &title, stills_rx, heard))
         };
         let dir = r.work.join("stills");
         std::fs::create_dir_all(&dir)?;
@@ -1539,7 +1539,7 @@ fn live(x: &Ext, job: &Job) -> anyhow::Result<Value> {
         if h.quiet > 0 { format!(", {} chunks with no words", h.quiet) } else { String::new() },
         credits.line()
     );
-    if let Err(e) = board_post(&x.h, thread, &summary) {
+    if let Err(e) = board_post(&x.h, channel, &summary) {
         x.h.log(format!("live: couldn't post the summary: {e:#}"));
     }
     if transcript.is_file() {
@@ -1649,7 +1649,7 @@ fn fix(x: &Ext, fix: &HealthFixRequest) -> anyhow::Result<HealthFixResponse> {
     let message = match (fix.part.as_str(), fix.action.as_known()) {
         ("key", Some(Action::Auth)) => {
             *lock(&x.account) = None;
-            "Add an ElevenLabs API key with /elevenlabs add in any thread: the app opens a form, so it never goes in a \
+            "Add an ElevenLabs API key with /elevenlabs add in any channel: the app opens a form, so it never goes in a \
              post. It's on elevenlabs.io: Developers › API Keys."
                 .to_string()
         }
