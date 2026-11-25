@@ -27,7 +27,7 @@ linux = ["/usr/local/bin/elevenlabs"]
 [permissions]
 network = true                   # ElevenLabs' API, through its CLI; its releases on GitHub; live streams
 secrets = ["elevenlabs.*"]       # API keys, kept in the vault as elevenlabs.<label>
-post = true                      # elevenlabs.live posts what a stream says to the thread it's given
+post = true                      # elevenlabs.live posts what a stream says to the channel it's given
 
 [[credentials]]
 id = "key"
@@ -109,12 +109,12 @@ summary = "Force-align a transcript to its audio: each word's start and end"
 
 [[commands]]
 kind = "elevenlabs.live"
-title = "Hear a live stream (url, thread) → posts as it's said"
-params = { type = "object", properties = { url = { type = "string", description = "A YouTube live URL, anything yt-dlp or ffmpeg reads (an .m3u8, rtmp://, srt://), or mic:<name or index> for this Mac's microphone" }, camera = { type = "string", description = "With mic:, the camera to take stills from: its name or index" }, thread = { type = "string", description = "The thread to post in: thr_123, or 123" }, every_seconds = { type = "number", default = 15, minimum = 5, maximum = 120, description = "How much of the stream each post covers" }, stills_every_seconds = { type = "number", default = 60, minimum = 0, maximum = 3600, description = "A still of the picture this often (at least 10); 0 for none" }, language = { type = "string", description = "An ISO 639 code (en); detected if not given" }, model = { type = "string", description = "scribe_v1 if not given" }, minutes = { type = "number", default = 120, minimum = 0.1, maximum = 480, description = "When to stop listening, at the latest" } }, required = ["url", "thread"], additionalProperties = false }
+title = "Hear a live stream (url, channel) → posts as it's said"
+params = { type = "object", properties = { url = { type = "string", description = "A YouTube live URL, anything yt-dlp or ffmpeg reads (an .m3u8, rtmp://, srt://), or mic:<name or index> for this Mac's microphone" }, camera = { type = "string", description = "With mic:, the camera to take stills from: its name or index" }, channel = { type = "string", description = "The channel to post in: ch_123, or 123" }, every_seconds = { type = "number", default = 15, minimum = 5, maximum = 120, description = "How much of the stream each post covers" }, stills_every_seconds = { type = "number", default = 60, minimum = 0, maximum = 3600, description = "A still of the picture this often (at least 10); 0 for none" }, language = { type = "string", description = "An ISO 639 code (en); detected if not given" }, model = { type = "string", description = "scribe_v1 if not given" }, minutes = { type = "number", default = 120, minimum = 0.1, maximum = 480, description = "When to stop listening, at the latest" } }, required = ["url", "channel"], additionalProperties = false }
 cancellable = true
 outputs = ["document"]
 slash = "live"
-summary = "Listen to a live stream: what's said posted to a thread every 15 s, a still every minute"
+summary = "Listen to a live stream: what's said posted to a channel every 15 s, a still every minute"
 
 [[commands]]
 kind = "elevenlabs.voices"

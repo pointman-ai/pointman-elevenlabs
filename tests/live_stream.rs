@@ -1,5 +1,5 @@
 //! `elevenlabs.live` under the stand-in node, with the fake CLI and the machine's ffmpeg: a 12 s clip with a
-//! picture and a tone, heard in 5 s chunks, each posted to the thread as `[HH:MM:SS UTC] words`, stills posted as
+//! picture and a tone, heard in 5 s chunks, each posted to the channel as `[HH:MM:SS UTC] words`, stills posted as
 //! files, and a transcript.jsonl. Skipped where there's no ffmpeg.
 
 mod common;
@@ -81,7 +81,7 @@ fn a_stream_is_heard_in_chunks_and_posted_as_lines() {
     let posted: Posted = Arc::default();
     let node = listening_node(&fake, &[folder.path()], &posted);
 
-    let params = json!({"url": file, "thread": "thr_7", "every_seconds": 5, "stills_every_seconds": 10});
+    let params = json!({"url": file, "channel": "ch_7", "every_seconds": 5, "stills_every_seconds": 10});
     let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs(90)).unwrap();
     let r = &done.result;
 
@@ -94,7 +94,7 @@ fn a_stream_is_heard_in_chunks_and_posted_as_lines() {
         let clock = &l[1..9];
         assert!(l.starts_with('[') && clock.chars().filter(|c| *c == ':').count() == 2, "{l}");
     }
-    assert!(posts.iter().all(|(m, p)| m != "board.post" || p["thread"]["id"] == "thr_7"), "{posts:?}");
+    assert!(posts.iter().all(|(m, p)| m != "board.post" || p["channel"]["id"] == "ch_7"), "{posts:?}");
     assert!(lines.last().unwrap().starts_with("Stopped listening to "), "the summary last: {lines:#?}");
     assert_eq!(r["posts"].as_u64().unwrap() as usize, heard.len());
     assert_eq!(r["stopped"], "the stream ended");
@@ -102,7 +102,7 @@ fn a_stream_is_heard_in_chunks_and_posted_as_lines() {
     let stills: Vec<&Value> = posts.iter().filter(|(m, _)| m == "files.publish").map(|(_, p)| p).collect();
     assert!(!stills.is_empty(), "no still: {posts:?}");
     let body = &stills[0]["body"];
-    assert_eq!(body["post"]["thread_id"].as_f64(), Some(7.0), "{body}");
+    assert_eq!(body["post"]["channel_id"].as_f64(), Some(7.0), "{body}");
     assert_eq!(body["files"][0]["mime"], "image/jpeg");
     assert!(Path::new(body["files"][0]["file"].as_str().unwrap()).is_file());
 
@@ -157,7 +157,7 @@ fn a_stream_that_hasnt_started_is_waited_for() {
     let settings = json!({"cli": fake.path().to_string_lossy(), "yt_dlp": ytdlp.to_string_lossy()});
     let node = listening_node_with(&[folder.path()], &posted, settings);
 
-    let params = json!({"url": "https://www.youtube.com/watch?v=x", "thread": "thr_7", "every_seconds": 5, "stills_every_seconds": 0, "minutes": 1});
+    let params = json!({"url": "https://www.youtube.com/watch?v=x", "channel": "ch_7", "every_seconds": 5, "stills_every_seconds": 0, "minutes": 1});
     let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs(90)).unwrap();
     let lines: Vec<String> = posted
         .lock()
@@ -175,7 +175,7 @@ fn a_stream_that_hasnt_started_is_waited_for() {
     assert!(done.result["posts"].as_u64().unwrap() >= 1);
 }
 
-/// A stretch with no words (music, a pause) is said in the thread every so often, so it isn't taken for a fault;
+/// A stretch with no words (music, a pause) is said in the channel every so often, so it isn't taken for a fault;
 /// the summary counts the chunks. (The tests say it every 8 s; a stream every 2 min.)
 #[test]
 fn a_quiet_stretch_is_said() {
@@ -189,7 +189,7 @@ fn a_quiet_stretch_is_said() {
     let file = clip(&ffmpeg, folder.path(), 12);
     let posted: Posted = Arc::default();
     let node = listening_node(&fake, &[folder.path()], &posted);
-    let params = json!({"url": file, "thread": "thr_7", "every_seconds": 5, "stills_every_seconds": 0});
+    let params = json!({"url": file, "channel": "ch_7", "every_seconds": 5, "stills_every_seconds": 0});
     let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs(90)).unwrap();
     let lines: Vec<String> =
         posted.lock().unwrap().iter().map(|(_, p)| p["text"].as_str().unwrap_or_default().to_string()).collect();
@@ -208,11 +208,11 @@ fn what_isnt_a_stream_is_refused() {
     let posted: Posted = Arc::default();
     let node = listening_node(&fake, &[], &posted);
     for url in ["file:///etc/passwd", "concat:/a|/b", "-i"] {
-        let e = node.run("elevenlabs.live", json!({"url": url, "thread": "thr_7"})).unwrap_err();
+        let e = node.run("elevenlabs.live", json!({"url": url, "channel": "ch_7"})).unwrap_err();
         assert!(!e.to_string().is_empty(), "{url}");
     }
     let e = node.run("elevenlabs.live", json!({"url": "https://youtu.be/x"})).unwrap_err();
-    assert!(e.to_string().contains("thread is missing"), "{e}");
+    assert!(e.to_string().contains("channel is missing"), "{e}");
     assert!(posted.lock().unwrap().is_empty());
     assert!(fake.calls().iter().all(|c| !c.is("speech-to-text", "convert")));
 }
@@ -228,7 +228,7 @@ fn a_real_stream_through_the_fake_cli() {
     let fake = Fake::new();
     let posted: Posted = Arc::default();
     let node = listening_node(&fake, &[], &posted);
-    let params = json!({"url": url, "thread": "thr_7", "minutes": minutes, "stills_every_seconds": 20});
+    let params = json!({"url": url, "channel": "ch_7", "minutes": minutes, "stills_every_seconds": 20});
     let done = node.run_timeout("elevenlabs.live", params, Duration::from_secs_f64(minutes * 60.0 + 120.0)).unwrap();
     for (m, p) in posted.lock().unwrap().iter() {
         match m.as_str() {
