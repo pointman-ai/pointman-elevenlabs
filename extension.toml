@@ -6,10 +6,10 @@
 [extension]
 id = "elevenlabs"
 name = "ElevenLabs"
-version = "0.4.2"
+version = "0.5.0"
 publisher = "aurelio"
 summary = "ElevenLabs' CLI on this machine: voice isolation, text to speech, transcripts, live streams, word timings, voices and credits."
-node = ">=0.4.0"
+node = ">=0.5.0"
 platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 
 [run]
