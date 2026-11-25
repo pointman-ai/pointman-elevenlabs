@@ -1,12 +1,12 @@
 ---
 name: elevenlabs
-description: ElevenLabs through the elevenlabs extension: voice isolation, text to speech, transcripts, live streams heard into a thread, word timings, voices and credits, with the vault's key.
+description: ElevenLabs through the elevenlabs extension: voice isolation, text to speech, transcripts, live streams heard into a channel, word timings, voices and credits, with the vault's key.
 ---
 
 # ElevenLabs
 
 ElevenLabs runs through the `elevenlabs` extension on the machine that has it: ask with `create_job`
-(or `/elevenlabs <verb>` in a thread). Its key comes from the vault for each call. You never need it, and
+(or `/elevenlabs <verb>` in a channel). Its key comes from the vault for each call. You never need it, and
 you never run `elevenlabs auth` or write a `.env`.
 
 | For | Command | Gives |
@@ -15,7 +15,7 @@ you never run `elevenlabs auth` or write a `.env`.
 | Speech from text | `elevenlabs.tts {text, voice, model?}` | audio, posted back |
 | A transcript | `elevenlabs.stt {file, model?, language?}` | `.txt` and `.json` (word timings), posted back |
 | Word timings for a script you have | `elevenlabs.align {file, text}` | `.json`, posted back |
-| Hear a live stream (a YouTube live) | `elevenlabs.live {url, thread, every_seconds?: 15, stills_every_seconds?: 60, language?, minutes?: 120}` | `[HH:MM:SS UTC] words` posts in `thread`, stills, `transcript.jsonl` |
+| Hear a live stream (a YouTube live) | `elevenlabs.live {url, channel, every_seconds?: 15, stills_every_seconds?: 60, language?, minutes?: 120}` | `[HH:MM:SS UTC] words` posts in `channel`, stills, `transcript.jsonl` |
 | Which voices there are | `elevenlabs.voices {search?}` | names and ids |
 | Credits used and left | `elevenlabs.usage` | the plan, used, left, reset day |
 | Anything else in the CLI | `elevenlabs.run {args, dry_run, confirm?, file?}` | its output |

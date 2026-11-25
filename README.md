@@ -1,7 +1,7 @@
 # elevenlabs
 
 A Pointman extension for [ElevenLabs](https://elevenlabs.io): voice isolation, text to speech, transcripts, word
-timings, voices and credits, from any thread or agent, on the machines that have it. It's a thin wrapper of
+timings, voices and credits, from any channel or agent, on the machines that have it. It's a thin wrapper of
 ElevenLabs' official CLI ([elevenlabs/cli](https://github.com/elevenlabs/cli), `elevenlabs <service> <verb>`):
 each command is one CLI call, and `elevenlabs.run` passes anything else through.
 
@@ -18,7 +18,7 @@ crate (the node's typed protocol: each method's params and result are its messag
 | `elevenlabs.stt {file, model?, language?}` | `/elevenlabs stt` | A transcript (`speech-to-text convert`, `scribe_v1` unless `model` says), posted back as `.txt` and `.json` (word timings) |
 | `elevenlabs.align {file, text}` | `/elevenlabs align` | Each word's start and end (`forced-alignment create`), posted back as `.json` |
 | `elevenlabs.voices {search?}` | `/elevenlabs voices` | The voices the key can use: names, ids and kinds |
-| `elevenlabs.live {url, thread, every_seconds?, stills_every_seconds?, language?, model?, minutes?}` | `/elevenlabs live` | Listens to a live stream (a YouTube live URL, or anything yt-dlp or ffmpeg reads) and posts what's said to `thread` as `[HH:MM:SS UTC] words`, every 15 s, with a still every 60 s. Writes `transcript.jsonl` |
+| `elevenlabs.live {url, channel, every_seconds?, stills_every_seconds?, language?, model?, minutes?}` | `/elevenlabs live` | Listens to a live stream (a YouTube live URL, or anything yt-dlp or ffmpeg reads) and posts what's said to `channel` as `[HH:MM:SS UTC] words`, every 15 s, with a still every 60 s. Writes `transcript.jsonl` |
 | `elevenlabs.usage` | `/elevenlabs usage` | The plan, credits used and left this period, and when they reset |
 | `elevenlabs.run {args, dry_run, confirm?, file?}` | `/elevenlabs run` | Any CLI command (`args` are the words after `elevenlabs`). A dry run unless `dry_run: false` |
 | `elevenlabs.add` | `/elevenlabs add` | Opens the app's form for an API key |
@@ -48,7 +48,7 @@ crate (the node's typed protocol: each method's params and result are its messag
 
 ## The key
 
-An ElevenLabs API key (elevenlabs.io: Developers › API Keys), added with `/elevenlabs add` in any thread: the
+An ElevenLabs API key (elevenlabs.io: Developers › API Keys), added with `/elevenlabs add` in any channel: the
 app's form seals it in the vault as `elevenlabs.<label>`, so it never goes in a post. The extension may open
 only `elevenlabs.*` items.
 

@@ -90,11 +90,11 @@ fn direct(url: &str) -> bool {
         .any(|e| path.ends_with(e))
 }
 
-/// A thread's number from `thr_71027`, `71027`, or a number.
-pub fn thread_id(given: &serde_json::Value) -> Option<i64> {
+/// A channel's number from `ch_71027`, `71027`, or a number.
+pub fn channel_id(given: &serde_json::Value) -> Option<i64> {
     let n = match given {
         serde_json::Value::Number(n) => n.as_i64()?,
-        serde_json::Value::String(s) => s.trim().trim_start_matches("thr_").parse().ok()?,
+        serde_json::Value::String(s) => s.trim().trim_start_matches("ch_").parse().ok()?,
         _ => return None,
     };
     (n > 0).then_some(n)
@@ -274,12 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn threads_by_any_name() {
-        assert_eq!(thread_id(&json!("thr_71027")), Some(71027));
-        assert_eq!(thread_id(&json!("71027")), Some(71027));
-        assert_eq!(thread_id(&json!(71027)), Some(71027));
-        assert_eq!(thread_id(&json!("post_5")), None);
-        assert_eq!(thread_id(&json!(0)), None);
+    fn channels_by_any_name() {
+        assert_eq!(channel_id(&json!("ch_71027")), Some(71027));
+        assert_eq!(channel_id(&json!("71027")), Some(71027));
+        assert_eq!(channel_id(&json!(71027)), Some(71027));
+        assert_eq!(channel_id(&json!("post_5")), None);
+        assert_eq!(channel_id(&json!(0)), None);
     }
 
     #[test]
